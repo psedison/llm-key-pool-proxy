@@ -1,0 +1,12 @@
+# Key 池配置模板
+# 复制本文件为 keys.txt（keys.txt 已被 .gitignore 排除，不会上传），填入真实 Key。
+#
+# 每行一个，# 开头为注释。格式：key|base_url（地址必填，代理无默认上游假设）
+#
+# 行序 = priority 策略的优先级（第一行是主力账号，流量固定在它上面，上游前缀缓存最友好）
+#
+# 示例：A 地址挂 2 个 key，B 地址挂 1 个 key（任何 OpenAI 兼容上游均可）
+# ag-xxxxxxxxaaaaaaaa|https://ark.cn-beijing.volces.com/api/plan/v3
+# ag-xxxxxxxxbbbbbbbb|https://ark.cn-beijing.volces.com/api/plan/v3
+# sk-xxxxxxxxcccccccc|https://api.deepseek.com/v1
+# sk-proj-xxxxxxxxdddd|https://api.openai.com/v1
