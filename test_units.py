@@ -171,6 +171,25 @@ class TestRateLimitClassification(unittest.TestCase):
         self.assertEqual(classify_failure(429, self.REAL_BODY), "ratelimit")
         self.assertTrue(looks_like_rate_limit_error(self.REAL_BODY))
 
+    def test_unknown_429_body_never_server(self):
+        """真实事故回归（2026-09-15）：未知文案的 429 曾被归为 server，
+        server 类计入禁用 → 全池冷却瘫痪。429 必须兜底为 ratelimit。"""
+        self.assertEqual(classify_failure(429, b'{"code":"SomethingNew","message":"busy"}'), "ratelimit")
+        self.assertEqual(classify_failure(429, b""), "ratelimit")
+        self.assertEqual(classify_failure(408, b""), "ratelimit")
+        self.assertEqual(classify_failure(425, b""), "ratelimit")
+
+    def test_unknown_429_short_cooldown_never_disables(self):
+        pool = KeyPool(
+            keys=[KeyEntry(key="k1"), KeyEntry(key="k2")],
+            cooldown_seconds=60.0,
+            ratelimit_cooldown_seconds=5.0,
+        )
+        e1, _ = pool.acquire()
+        for _ in range(6):
+            pool.report_failure(e1, "HTTP 429", "ratelimit")
+        self.assertTrue(e1.enabled, "429 fallback must never disable a key")
+
     def test_rate_limit_not_misclassified_as_server(self):
         # 修复前：此报文不含 quota 关键词 → 被归为 server（60s 冷却 + 计入禁用）
         pool = KeyPool(

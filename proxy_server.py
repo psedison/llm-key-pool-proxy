@@ -1,6 +1,6 @@
-"""通用 LLM API Key 池代理服务。
+"""火山 Agent Plan Key 池代理服务。
 
-- 下游请求 → 按 池策略 取一个可用 Key → 转发到该 Key 绑定的上游接口 → 回传响应（支持 SSE 流式）
+- 下游请求 → 按 池策略 取一个可用 Key → 转发到火山官方接口 → 回传响应（支持 SSE 流式）
 - 401/403/429/配额不足/5xx/网络错误 → 标记失败并自动换下一个 Key 重试
 - GET /pool/status、POST /pool/recover 管理接口
 
@@ -42,7 +42,7 @@ QUOTA_ERROR_MARKERS = (
     "额度",
 )
 
-# 真实报文样例（火山方舟，2026-09）：
+# 火山真实报文样例（2026-09）：
 # ① 配额打满（长冷却）：
 # {"code":"AccountQuotaExceeded","message":"You have exceeded the 5-hour usage quota.
 #  It will reset at 2026-09-13 22:36:33 +0800 CST. ...","type":"TooManyRequests"}
@@ -82,12 +82,12 @@ def parse_key_line(line: str) -> tuple[str, str] | None:
 
 
 def load_entries() -> list[KeyEntry]:
-    """Key 池条目来源：KEYPOOL_KEYS 环境变量优先，其次 keys.txt。
+    """Key 池条目来源：VOLC_KEYS 环境变量优先，其次 keys.txt。
 
     每项格式 "key|base_url"，base_url 必填（无默认上游假设）。
     """
     raw: list[str]
-    env_keys = os.environ.get("KEYPOOL_KEYS", "")
+    env_keys = os.environ.get("VOLC_KEYS", "")
     if env_keys.strip():
         raw = env_keys.split(",")
     elif os.path.isfile(config.KEYS_FILE):
@@ -157,8 +157,10 @@ def extract_json_usage(body: bytes) -> dict | None:
 def classify_failure(status: int, body: bytes) -> str:
     """返回失败类别：quota | ratelimit | auth | server。决定冷却时长。
 
-    注意顺序：先判 ratelimit 再判 quota——`AccountRateLimitExceeded` 不含 quota 关键词，
-    但未来上游若同时提及两者，"too frequent"（频率限流）应优先，冷却更短更合理。
+    顺序：先按报文精确归类（ratelimit → quota），再按状态码兜底。
+    429/408/425 的语义就是"限流/重试"，无论报文文案是什么，都不得落为
+    server——server 类会计入禁用阈值且冷却更长，历史上曾因火山未知的
+    429 文案把整个 Key 池打瘫（真实事故 2026-09-15）。
     """
     if looks_like_rate_limit_error(body):
         return "ratelimit"
@@ -166,6 +168,8 @@ def classify_failure(status: int, body: bytes) -> str:
         return "quota"
     if status in (401, 403):
         return "auth"
+    if status in (408, 425, 429):
+        return "ratelimit"  # 报文未识别的限流类状态码：按频率限流兜底（短冷却、不禁用）
     return "server"
 
 
@@ -180,7 +184,7 @@ def looks_like_rate_limit_error(body: bytes) -> bool:
 
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "llm-key-pool-proxy/1.0"
+    server_version = "volc-keypool-proxy/1.0"
     pool: KeyPool  # 由 run() 注入
 
     def handle_one_request(self):
@@ -387,8 +391,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 detail = "DISABLED" if disabled else "cooldown"
             log.warning(
-                "key %s failed (%s, HTTP %d), %s; switch to next key",
+                "key %s failed (%s, HTTP %d), %s; switch to next key; body=%r",
                 mask_key(entry.key), fail_kind, status, detail,
+                err_body[:300].decode("utf-8", "replace"),
             )
             last_err_status, last_err_body = status, err_body
 
@@ -605,7 +610,7 @@ def run() -> None:
     if not entries:
         log.error(
             "no keys configured. Put keys into %s (one per line as 'key|base_url')"
-            " or set KEYPOOL_KEYS env var (comma-separated 'key|base_url').",
+            " or set VOLC_KEYS env var (comma-separated 'key|base_url').",
             config.KEYS_FILE,
         )
         sys.exit(1)
@@ -614,7 +619,7 @@ def run() -> None:
     if unbound:
         log.error(
             "keys without base_url: %s. Every key must be configured as 'key|base_url'"
-            " (e.g. 'sk-xxx|https://api.deepseek.com/v1')."
+            " (e.g. 'ag-xxx|https://ark.cn-beijing.volces.com/api/plan/v3')."
             " No default upstream is assumed.",
             ", ".join(unbound),
         )
