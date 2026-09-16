@@ -430,7 +430,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _log_usage(usage: dict) -> None:
-        """请求完成后输出 token 用量：in/out/缓存命中/推理 token。"""
+        """请求完成后输出 token 用量：in/out/缓存命中率/推理 token。"""
         cached = usage.get("prompt_tokens_details", {}).get("cached_tokens") if isinstance(
             usage.get("prompt_tokens_details"), dict) else None
         reasoning = usage.get("completion_tokens_details", {}).get("reasoning_tokens") if isinstance(
@@ -439,8 +439,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"in={usage.get('prompt_tokens', '?')}",
             f"out={usage.get('completion_tokens', '?')}",
         ]
-        if cached:
-            parts.append(f"cached={cached}")
+        if cached is not None:
+            prompt = usage.get("prompt_tokens") or 0
+            hit_pct = f" ({cached * 100 // prompt}%)" if prompt else ""
+            parts.append(f"cached={cached}{hit_pct}")
         if reasoning:
             parts.append(f"reasoning={reasoning}")
         log.info("usage: %s", " ".join(parts))
