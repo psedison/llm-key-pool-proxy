@@ -341,7 +341,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.warning("no usable key at attempt %d", attempt)
                 break
             log.info(
-                "attempt %d/%d using key %s (usable=%d) %s -> %s%s [upstream=%s]",
+                "try %d of %d using key %s (usable=%d in pool) %s -> %s%s [upstream=%s]",
                 attempt, max_attempts, mask_key(entry.key), usable, self.command,
                 self.path, " [stream]" if wants_stream else "",
                 entry.base_url,
