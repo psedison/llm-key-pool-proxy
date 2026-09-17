@@ -70,28 +70,23 @@ class KeyPool:
 
     # ---------- 选取 ----------
 
-    def acquire(self, exclude: set[str] | None = None,
-                eligible=None) -> tuple[KeyEntry | None, int]:
+    def acquire(self, exclude: set[str] | None = None) -> tuple[KeyEntry | None, int]:
         """取一个当前可用的 Key。
 
-        exclude:  本次请求已尝试过的 Key 集合——同一请求内不重复尝试同一把
-                  （网络失败不冷却，但要防止同一请求内反复撞同一把）
-        eligible: 可选谓词 (KeyEntry) -> bool。多上游分组路由用：请求路径
-                  决定服务分组，只有绑定地址路径匹配的 Key 才有资格服务该请求
+        exclude: 本次请求已尝试过的 Key 集合——同一请求内不重复尝试同一把
+                 （网络失败/服务不匹配不冷却，但要防止同一请求内反复撞同一把）
 
         priority:   始终取排最前的可用 Key（固定优先级，缓存友好，失败才顺延）
         round_robin: 按游标轮转
         random:     可用集合随机
 
         返回 (entry, usable_count)。没有可用 Key 时返回 (None, 0)。
-        usable_count 是"通过本调用全部筛选条件的 Key 数"，非池总数。
         """
         with self._lock:
             now = time.time()
             exclude = exclude or set()
             usable = [e for e in self.keys
-                      if e.is_usable(now) and e.key not in exclude
-                      and (eligible is None or eligible(e))]
+                      if e.is_usable(now) and e.key not in exclude]
             if not usable:
                 return None, 0
             if self.strategy == "random":
@@ -140,7 +135,7 @@ class KeyPool:
 
     def report_failure(self, entry: KeyEntry, reason: str, kind: str = "auth",
                        cooldown_until: float | None = None) -> bool:
-        """记账一次失败。kind: auth | quota | ratelimit | server。
+        """记账一次失败。kind: auth | quota | ratelimit | mismatch | server。
 
         冷却规则：
         - 调用方给出 cooldown_until（如上游报文带明确重置时间）则精确冷却到该时刻
@@ -149,15 +144,24 @@ class KeyPool:
 
         禁用规则（需要人工 /pool/recover 才能恢复，因此极度克制）：
         **只有 auth 类失败（401/403 无效凭证）连续超阈值才禁用**——只有它能证明
-        Key 本身已坏且短时间内不会自愈。quota/ratelimit 是正常业务波动，server/5xx
-        与网络故障可能是上游或本机问题，都不能证明 Key 坏了，一律不禁用。
+        Key 本身已坏且短时间内不会自愈。
+        - quota/ratelimit 是正常业务波动：冷却但不禁用
+        - mismatch（该 Key 的上游不提供请求所需的服务/模型）：不冷却、不计连续
+          失败，也不是 Key 的错——换下一把 Key 用它自己的地址重试即可
+        - server/5xx 与网络故障可能是上游或本机问题，不能证明 Key 坏，不禁用
         返回是否触发了禁用。
         """
         with self._lock:
-            fails_before = entry.consecutive_fails
             entry.total_fail += 1
-            entry.consecutive_fails = fails_before + 1
             entry.last_error = f"[{kind}] {reason}"[:300]
+            if kind == "mismatch":
+                log.info(
+                    "key %s can't serve this request (mismatch); rotating to next key",
+                    mask_key(entry.key),
+                )
+                return False  # 不冷却、不计连续失败，Key 立即可用于其他请求
+            fails_before = entry.consecutive_fails
+            entry.consecutive_fails = fails_before + 1
             if cooldown_until is not None:
                 delay = max(0.0, cooldown_until - time.time())
             else:

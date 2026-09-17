@@ -65,6 +65,17 @@ RATE_LIMIT_MARKERS = (
     "频率",
 )
 
+# 模型/服务不匹配（该 Key 的上游不提供此请求所需的能力）：换 Key 重试，不冷却
+# 真实报文样例：{"code":"UnsupportedModel","message":"The requested model does not
+# support the agent plan feature. ..."}
+MODEL_MISMATCH_MARKERS = (
+    "unsupportedmodel",
+    "model not found",
+    "does not support",
+    "not support the",
+    "不支持",
+)
+
 # 这些路径不转发上游，属代理自身管理接口
 MANAGEMENT_PATHS = ("/pool/status", "/pool/recover")
 
@@ -113,8 +124,9 @@ def load_entries() -> list[KeyEntry]:
 # ---------- 上游错误判定 ----------
 
 def is_retryable_status(status: int) -> bool:
-    # 401/403 鉴权失败；408/425/429 限流；5xx 上游故障 → 换 Key
-    return status in (401, 403, 408, 425, 429) or status >= 500
+    # 401/403 鉴权失败；404 服务/模型不匹配（换 Key 换地址重试）；
+    # 408/425/429 限流；5xx 上游故障 → 换 Key
+    return status in (401, 403, 404, 408, 425, 429) or status >= 500
 
 
 def looks_like_quota_error(body: bytes) -> bool:
@@ -155,23 +167,61 @@ def extract_json_usage(body: bytes) -> dict | None:
         return None
 
 
-def classify_failure(status: int, body: bytes) -> str:
-    """返回失败类别：quota | ratelimit | auth | server。决定冷却时长。
+def build_upstream_url(base_url: str, downstream_path: str) -> str:
+    """上游 URL = Key 绑定地址 + 端点后缀。
 
-    顺序：先按报文精确归类（ratelimit → quota），再按状态码兜底。
+    对外暴露的路径前缀只是代理自己的命名空间：剥离已知前缀后，把剩余的
+    端点后缀拼到 Key 自己的地址后面。Key 的地址（含其路径部分）完全决定
+    上游服务，与对外前缀零耦合——客户端想配什么前缀都行。
+    未设路径的纯域名 Key 保持旧透明语义：完整镜像下游路径。
+    """
+    d = urllib.parse.urlsplit(downstream_path)
+    b = urllib.parse.urlsplit(base_url)
+    bpath = b.path.rstrip("/")
+    if not bpath:
+        upstream_path = d.path  # 纯域名 Key：透明镜像
+    else:
+        suffix = d.path
+        for p in sorted(config.UPSTREAM_PATH_PREFIXES, key=len, reverse=True):
+            if d.path == p or d.path.startswith(p + "/"):
+                suffix = d.path[len(p):] or "/"
+                break
+        if not suffix.startswith("/"):
+            suffix = "/" + suffix
+        upstream_path = bpath + suffix
+    return urllib.parse.urlunsplit((b.scheme, b.netloc, upstream_path, d.query, ""))
+
+
+def classify_failure(status: int, body: bytes) -> str:
+    """返回失败类别：quota | ratelimit | mismatch | auth | server。决定冷却时长。
+
+    顺序：先按报文精确归类（ratelimit → quota → 模型不匹配），再按状态码兜底。
     429/408/425 的语义就是"限流/重试"，无论报文文案是什么，都不得落为
     server——server 类会计入禁用阈值且冷却更长，历史上曾因火山未知的
     429 文案把整个 Key 池打瘫（真实事故 2026-09-15）。
+    404 归为 mismatch（模型/服务不匹配，如 plan 请求打到 coding Key 上）：
+    不是 Key 的错，换下一把 Key 用它自己的地址重试。
     """
     if looks_like_rate_limit_error(body):
         return "ratelimit"
     if looks_like_quota_error(body):
         return "quota"
+    if looks_like_model_mismatch(body):
+        return "mismatch"
     if status in (401, 403):
         return "auth"
     if status in (408, 425, 429):
         return "ratelimit"  # 报文未识别的限流类状态码：按频率限流兜底（短冷却、不禁用）
+    if status == 404:
+        return "mismatch"  # 未知 404：大概率该 Key 的服务不提供此端点/模型
     return "server"
+
+
+def looks_like_model_mismatch(body: bytes) -> bool:
+    if not body:
+        return False
+    text = body[:4096].decode("utf-8", errors="replace").lower()
+    return any(m in text for m in MODEL_MISMATCH_MARKERS)
 
 
 def looks_like_rate_limit_error(body: bytes) -> bool:
@@ -262,17 +312,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
     # ----- 上游转发 -----
 
     def _build_upstream_request(self, body: bytes, entry) -> urllib.request.Request:
-        parsed = urllib.parse.urlsplit(self.path)
-        base = urllib.parse.urlsplit(entry.base_url)
-        # base_url 可带路径（如 https://host/api/plan/v3）：客户端请求 /api/plan/v3/xxx
-        # 时，下游路径里已含前缀，直接用；否则把 base 自带的前缀路径拼到下游路径前。
-        downstream_path = parsed.path
-        base_prefix = base.path.rstrip("/")
-        if base_prefix and not downstream_path.startswith(base_prefix):
-            downstream_path = base_prefix + downstream_path
-        upstream_url = urllib.parse.urlunsplit(
-            (base.scheme, base.netloc, downstream_path, parsed.query, "")
-        )
+        # 上游 URL 完全由 Key 自己的地址决定：剥离对外前缀（代理的命名空间），
+        # 端点后缀拼到 Key 地址后面——对外前缀与后端地址零耦合
+        upstream_url = build_upstream_url(entry.base_url, self.path)
         headers = {
             "Content-Type": self.headers.get("Content-Type", "application/json"),
             "Accept": self.headers.get("Accept", "application/json"),
@@ -333,51 +375,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _relay(self) -> None:
         body = self._read_request_body()
         wants_stream = self._client_wants_stream(body)
-        downstream_path = urllib.parse.urlsplit(self.path).path
-
-        # 多上游分组路由：请求路径决定服务分组。Key 绑定地址的路径部分
-        # 即其所属分组（如 /api/plan/v3 与 /api/coding/v3 是两个不同服务），
-        # 请求只会路由到"路径匹配"（或未设路径的通用）Key——跨组调用
-        # 会拼出双重前缀的非法路径，曾导致 SSL EOF（真实事故 2026-09-17）。
-        service_prefix = ""
-        for p in config.UPSTREAM_PATH_PREFIXES:
-            if downstream_path.startswith(p) and len(p) > len(service_prefix):
-                service_prefix = p
-
-        def eligible_for_path(e) -> bool:
-            bp = urllib.parse.urlsplit(e.base_url).path.rstrip("/")
-            return bp == "" or downstream_path == bp or downstream_path.startswith(bp + "/")
-
-        eligible = [e for e in self.pool.keys
-                    if e.is_usable(time.time()) and eligible_for_path(e)]
-        if not eligible:
-            bound = sorted({urllib.parse.urlsplit(e.base_url).path.rstrip("/")
-                            for e in self.pool.keys
-                            if urllib.parse.urlsplit(e.base_url).path})
-            log.error(
-                "no key serves path prefix %s (pool keys bound to: %s); "
-                "point the downstream client at one of those prefixes",
-                service_prefix or "(none)", ", ".join(bound) or "(no path)",
-            )
-            self._send_json(503, {"error": {
-                "message": f"no key bound to path prefix '{service_prefix or downstream_path}'",
-                "keys_bound_to": bound,
-            }})
-            return
-
-        max_attempts = len(eligible)
+        max_attempts = max(1, len(self.pool.keys))
         last_err_status, last_err_body = 503, b'{"error":"no usable key"}'
-        tried: set[str] = set()  # 同一请求内已尝试的 Key，防止反复撞同一把
+        tried: set[str] = set()  # 同一请求内已尝试的 Key：网络失败不冷却，但不能反复撞同一把
 
         for attempt in range(1, max_attempts + 1):
-            entry, usable = self.pool.acquire(exclude=tried, eligible=eligible_for_path)
+            entry, usable = self.pool.acquire(exclude=tried)
             if entry is None:
-                log.warning("no usable key at attempt %d (%d eligible, %d already tried)",
-                            attempt, len(eligible), len(tried))
+                log.warning("no usable key at attempt %d (%d already tried)",
+                            attempt, len(tried))
                 break
             tried.add(entry.key)
             log.info(
-                "try %d of %d using key %s (eligible=%d in pool) %s -> %s%s [upstream=%s]",
+                "try %d of %d using key %s (usable=%d in pool) %s -> %s%s [upstream=%s]",
                 attempt, max_attempts, mask_key(entry.key), usable, self.command,
                 self.path, " [stream]" if wants_stream else "",
                 entry.base_url,

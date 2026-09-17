@@ -6,9 +6,11 @@ import urllib.parse
 
 from key_pool import KeyEntry, KeyPool, mask_key
 from proxy_server import (
+    build_upstream_url,
     classify_failure,
     looks_like_quota_error,
     looks_like_rate_limit_error,
+    looks_like_model_mismatch,
     parse_key_line,
     parse_reset_time,
 )
@@ -221,60 +223,64 @@ class TestRateLimitClassification(unittest.TestCase):
         self.assertLess(rl_cooldown, q_cooldown)
 
 
-class TestGroupRouting(unittest.TestCase):
-    """多上游分组路由回归（真实事故 2026-09-17：coding Key 被派去服务 plan 请求，
-    拼出双重前缀路径 → SSL EOF；且网络失败后同一请求内反复重试同一把 Key）。"""
+class TestUpstreamUrlBuilding(unittest.TestCase):
+    """URL 语义回归：对外前缀只是代理命名空间（剥离），Key 地址全权决定上游服务。
+    真实事故 2026-09-17：plan 请求打到 coding Key 拼出双重前缀路径 → SSL EOF。"""
 
-    def _pool(self) -> KeyPool:
-        return KeyPool(keys=[
-            KeyEntry(key="coding1", base_url="https://h/api/coding/v3"),
-            KeyEntry(key="coding2", base_url="https://h/api/coding/v3"),
-            KeyEntry(key="plan1", base_url="https://h/api/plan/v3"),
-            KeyEntry(key="plan2", base_url="https://h/api/plan/v3"),
-            KeyEntry(key="generic", base_url="https://h"),
-        ], strategy="priority")
+    def test_strips_exposed_prefix_and_uses_key_address(self):
+        self.assertEqual(
+            build_upstream_url("https://ark.example/api/plan/v3", "/api/plan/v3/chat/completions"),
+            "https://ark.example/api/plan/v3/chat/completions")
 
-    @staticmethod
-    def _eligible_for(downstream_path: str):
-        dp = urllib.parse.urlsplit(downstream_path).path
-        def pred(e):
-            bp = urllib.parse.urlsplit(e.base_url).path.rstrip("/")
-            return bp == "" or dp == bp or dp.startswith(bp + "/")
-        return pred
+    def test_same_request_via_coding_key_uses_coding_path(self):
+        self.assertEqual(
+            build_upstream_url("https://ark.example/api/coding/v3", "/api/plan/v3/chat/completions"),
+            "https://ark.example/api/coding/v3/chat/completions")
 
-    def test_plan_request_never_reaches_coding_keys(self):
-        pool = self._pool()
-        elig = self._eligible_for("/api/plan/v3/chat/completions")
-        e1, n = pool.acquire(eligible=elig)
-        self.assertEqual(e1.key, "plan1")
-        self.assertEqual(n, 3)  # plan1, plan2, generic（coding 两把被排除）
-        # 同一请求内排除已试过的，继续切下一把，coding 依然不可达
-        e2, _ = pool.acquire(exclude={e1.key}, eligible=elig)
-        self.assertEqual(e2.key, "plan2")
-        e3, _ = pool.acquire(exclude={e1.key, e2.key}, eligible=elig)
-        self.assertEqual(e3.key, "generic")
-        e4, n = pool.acquire(exclude={e1.key, e2.key, e3.key}, eligible=elig)
-        self.assertIsNone(e4)
-        self.assertEqual(n, 0)
+    def test_other_provider_key_gets_its_own_path(self):
+        self.assertEqual(
+            build_upstream_url("https://api.deepseek.com/v1", "/api/plan/v3/chat/completions"),
+            "https://api.deepseek.com/v1/chat/completions")
 
-    def test_coding_request_routes_to_coding_keys(self):
-        pool = self._pool()
-        elig = self._eligible_for("/api/coding/v3/chat/completions")
-        e1, n = pool.acquire(eligible=elig)
-        self.assertEqual(e1.key, "coding1")
-        self.assertEqual(n, 3)  # coding1, coding2, generic
+    def test_keeps_query_string(self):
+        self.assertEqual(
+            build_upstream_url("https://h/v1", "/v1/models?a=1"),
+            "https://h/v1/models?a=1")
 
-    def test_same_key_never_retried_within_request(self):
-        """网络失败不冷却，但同一请求内不能反复撞同一把 Key。"""
-        pool = self._pool()
-        seen = []
-        for _ in range(5):
-            e, n = pool.acquire(exclude=set(seen))
-            if e is None:
-                break
-            seen.append(e.key)
-        self.assertEqual(len(seen), len(set(seen)), "each key tried at most once per request")
-        self.assertEqual(sorted(seen), ["coding1", "coding2", "generic", "plan1", "plan2"])
+    def test_unknown_prefix_treated_as_suffix(self):
+        self.assertEqual(
+            build_upstream_url("https://h/api/plan/v3", "/chat/completions"),
+            "https://h/api/plan/v3/chat/completions")
+
+    def test_pathless_base_mirrors_full_path(self):
+        self.assertEqual(
+            build_upstream_url("https://api.deepseek.com", "/api/plan/v3/chat/completions"),
+            "https://api.deepseek.com/api/plan/v3/chat/completions")
+
+
+class TestModelMismatch(unittest.TestCase):
+    REAL_BODY = (
+        b'{"error":{"code":"UnsupportedModel","message":"The requested model does not '
+        b'support the agent plan feature. Please refer to the documentation ..."}}'
+    )
+
+    def test_real_unsupported_model_body(self):
+        self.assertEqual(classify_failure(404, self.REAL_BODY), "mismatch")
+        self.assertTrue(looks_like_model_mismatch(self.REAL_BODY))
+
+    def test_unknown_404_is_mismatch(self):
+        self.assertEqual(classify_failure(404, b""), "mismatch")
+        self.assertEqual(classify_failure(404, b'{"error":"no page"}'), "mismatch")
+
+    def test_mismatch_never_cools_or_disables(self):
+        pool = KeyPool(keys=[KeyEntry(key="k1"), KeyEntry(key="k2")], strategy="priority")
+        e1, _ = pool.acquire()
+        for _ in range(10):
+            pool.report_failure(e1, "UnsupportedModel", "mismatch")
+        self.assertTrue(e1.enabled)
+        self.assertEqual(e1.cooldown_until, 0.0, "mismatch must not cool the key down")
+        self.assertEqual(e1.consecutive_fails, 0, "mismatch must not count toward disable")
+        self.assertEqual(e1.total_fail, 10)  # 但记账保留，便于观察
 
 
 class TestQuotaNeverDisables(unittest.TestCase):
