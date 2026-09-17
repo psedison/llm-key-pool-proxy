@@ -16,7 +16,7 @@ def mask_key(key: str) -> str:
 @dataclass
 class KeyEntry:
     key: str
-    base_url: str = ""  # 该 Key 专属上游地址；空串表示用全局默认 VOLC_BASE_URL
+    base_url: str = ""  # 该 Key 专属上游地址；空串表示纯域名镜像（该 Key 未声明服务路径）
     enabled: bool = True  # 连续失败达到阈值后置 False，需恢复
     consecutive_fails: int = 0
     cooldown_until: float = 0.0  # epoch 秒；> now 表示冷却中

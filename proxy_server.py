@@ -94,12 +94,12 @@ def parse_key_line(line: str) -> tuple[str, str] | None:
 
 
 def load_entries() -> list[KeyEntry]:
-    """Key 池条目来源：VOLC_KEYS 环境变量优先，其次 keys.txt。
+    """Key 池条目来源：KEYPOOL_KEYS 环境变量优先，其次 keys.txt。
 
     每项格式 "key|base_url"，base_url 必填（无默认上游假设）。
     """
     raw: list[str]
-    env_keys = os.environ.get("VOLC_KEYS", "")
+    env_keys = os.environ.get("KEYPOOL_KEYS", "")
     if env_keys.strip():
         raw = env_keys.split(",")
     elif os.path.isfile(config.KEYS_FILE):
@@ -235,7 +235,7 @@ def looks_like_rate_limit_error(body: bytes) -> bool:
 
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "volc-keypool-proxy/1.0"
+    server_version = "llm-key-pool-proxy/1.0"
     pool: KeyPool  # 由 run() 注入
 
     def handle_one_request(self):
@@ -658,7 +658,7 @@ def run() -> None:
     if not entries:
         log.error(
             "no keys configured. Put keys into %s (one per line as 'key|base_url')"
-            " or set VOLC_KEYS env var (comma-separated 'key|base_url').",
+            " or set KEYPOOL_KEYS env var (comma-separated 'key|base_url').",
             config.KEYS_FILE,
         )
         sys.exit(1)

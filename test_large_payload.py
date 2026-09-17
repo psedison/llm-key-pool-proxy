@@ -105,7 +105,7 @@ def main() -> None:
 
     logf = open("proxy_large.log", "w", encoding="utf-8")
     env = dict(os.environ,
-               VOLC_KEYS=f"testkey-t123|{UP_BASE}",
+               KEYPOOL_KEYS=f"testkey-t123|{UP_BASE}",
                PROXY_PORT=str(PROXY_PORT),
                LOG_LEVEL="WARNING")
     proxy = subprocess.Popen([sys.executable, "proxy_server.py"],
