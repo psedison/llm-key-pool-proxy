@@ -1,4 +1,4 @@
-"""通用 API Key 池：优先级固定/轮询/随机选取、失败冷却、连续失败禁用、手动恢复，线程安全。"""
+"""火山 API Key 池：优先级固定/轮询/随机选取、失败冷却、连续失败禁用、手动恢复，线程安全。"""
 import logging
 import random
 import threading
@@ -16,7 +16,7 @@ def mask_key(key: str) -> str:
 @dataclass
 class KeyEntry:
     key: str
-    base_url: str = ""  # 该 Key 专属上游地址；空串表示无兜底（启动时校验必填）
+    base_url: str = ""  # 该 Key 专属上游地址；空串表示用全局默认 VOLC_BASE_URL
     enabled: bool = True  # 连续失败达到阈值后置 False，需恢复
     consecutive_fails: int = 0
     cooldown_until: float = 0.0  # epoch 秒；> now 表示冷却中
@@ -70,18 +70,28 @@ class KeyPool:
 
     # ---------- 选取 ----------
 
-    def acquire(self) -> tuple[KeyEntry | None, int]:
+    def acquire(self, exclude: set[str] | None = None,
+                eligible=None) -> tuple[KeyEntry | None, int]:
         """取一个当前可用的 Key。
+
+        exclude:  本次请求已尝试过的 Key 集合——同一请求内不重复尝试同一把
+                  （网络失败不冷却，但要防止同一请求内反复撞同一把）
+        eligible: 可选谓词 (KeyEntry) -> bool。多上游分组路由用：请求路径
+                  决定服务分组，只有绑定地址路径匹配的 Key 才有资格服务该请求
 
         priority:   始终取排最前的可用 Key（固定优先级，缓存友好，失败才顺延）
         round_robin: 按游标轮转
         random:     可用集合随机
 
         返回 (entry, usable_count)。没有可用 Key 时返回 (None, 0)。
+        usable_count 是"通过本调用全部筛选条件的 Key 数"，非池总数。
         """
         with self._lock:
             now = time.time()
-            usable = [e for e in self.keys if e.is_usable(now)]
+            exclude = exclude or set()
+            usable = [e for e in self.keys
+                      if e.is_usable(now) and e.key not in exclude
+                      and (eligible is None or eligible(e))]
             if not usable:
                 return None, 0
             if self.strategy == "random":
@@ -89,14 +99,16 @@ class KeyPool:
             elif self.strategy == "priority":
                 chosen = usable[0]
             else:
+                usable_ids = {id(e) for e in usable}
                 n = len(self.keys)
+                chosen = None
                 for i in range(n):
                     idx = (self._cursor + i) % n
-                    if self.keys[idx].is_usable(now):
+                    if id(self.keys[idx]) in usable_ids:
                         self._cursor = (idx + 1) % n
                         chosen = self.keys[idx]
                         break
-                else:
+                if chosen is None:
                     return None, 0
             chosen.last_used_at = now
             return chosen, len(usable)

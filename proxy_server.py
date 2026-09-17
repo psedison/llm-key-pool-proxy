@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -332,16 +333,51 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _relay(self) -> None:
         body = self._read_request_body()
         wants_stream = self._client_wants_stream(body)
-        max_attempts = max(1, len(self.pool.keys))
+        downstream_path = urllib.parse.urlsplit(self.path).path
+
+        # 多上游分组路由：请求路径决定服务分组。Key 绑定地址的路径部分
+        # 即其所属分组（如 /api/plan/v3 与 /api/coding/v3 是两个不同服务），
+        # 请求只会路由到"路径匹配"（或未设路径的通用）Key——跨组调用
+        # 会拼出双重前缀的非法路径，曾导致 SSL EOF（真实事故 2026-09-17）。
+        service_prefix = ""
+        for p in config.UPSTREAM_PATH_PREFIXES:
+            if downstream_path.startswith(p) and len(p) > len(service_prefix):
+                service_prefix = p
+
+        def eligible_for_path(e) -> bool:
+            bp = urllib.parse.urlsplit(e.base_url).path.rstrip("/")
+            return bp == "" or downstream_path == bp or downstream_path.startswith(bp + "/")
+
+        eligible = [e for e in self.pool.keys
+                    if e.is_usable(time.time()) and eligible_for_path(e)]
+        if not eligible:
+            bound = sorted({urllib.parse.urlsplit(e.base_url).path.rstrip("/")
+                            for e in self.pool.keys
+                            if urllib.parse.urlsplit(e.base_url).path})
+            log.error(
+                "no key serves path prefix %s (pool keys bound to: %s); "
+                "point the downstream client at one of those prefixes",
+                service_prefix or "(none)", ", ".join(bound) or "(no path)",
+            )
+            self._send_json(503, {"error": {
+                "message": f"no key bound to path prefix '{service_prefix or downstream_path}'",
+                "keys_bound_to": bound,
+            }})
+            return
+
+        max_attempts = len(eligible)
         last_err_status, last_err_body = 503, b'{"error":"no usable key"}'
+        tried: set[str] = set()  # 同一请求内已尝试的 Key，防止反复撞同一把
 
         for attempt in range(1, max_attempts + 1):
-            entry, usable = self.pool.acquire()
+            entry, usable = self.pool.acquire(exclude=tried, eligible=eligible_for_path)
             if entry is None:
-                log.warning("no usable key at attempt %d", attempt)
+                log.warning("no usable key at attempt %d (%d eligible, %d already tried)",
+                            attempt, len(eligible), len(tried))
                 break
+            tried.add(entry.key)
             log.info(
-                "try %d of %d using key %s (usable=%d in pool) %s -> %s%s [upstream=%s]",
+                "try %d of %d using key %s (eligible=%d in pool) %s -> %s%s [upstream=%s]",
                 attempt, max_attempts, mask_key(entry.key), usable, self.command,
                 self.path, " [stream]" if wants_stream else "",
                 entry.base_url,

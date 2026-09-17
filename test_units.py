@@ -2,6 +2,7 @@
 import calendar
 import time
 import unittest
+import urllib.parse
 
 from key_pool import KeyEntry, KeyPool, mask_key
 from proxy_server import (
@@ -218,6 +219,62 @@ class TestRateLimitClassification(unittest.TestCase):
         pool.report_failure(e1, "x", "quota")
         q_cooldown = e1.cooldown_until - time.time()
         self.assertLess(rl_cooldown, q_cooldown)
+
+
+class TestGroupRouting(unittest.TestCase):
+    """多上游分组路由回归（真实事故 2026-09-17：coding Key 被派去服务 plan 请求，
+    拼出双重前缀路径 → SSL EOF；且网络失败后同一请求内反复重试同一把 Key）。"""
+
+    def _pool(self) -> KeyPool:
+        return KeyPool(keys=[
+            KeyEntry(key="coding1", base_url="https://h/api/coding/v3"),
+            KeyEntry(key="coding2", base_url="https://h/api/coding/v3"),
+            KeyEntry(key="plan1", base_url="https://h/api/plan/v3"),
+            KeyEntry(key="plan2", base_url="https://h/api/plan/v3"),
+            KeyEntry(key="generic", base_url="https://h"),
+        ], strategy="priority")
+
+    @staticmethod
+    def _eligible_for(downstream_path: str):
+        dp = urllib.parse.urlsplit(downstream_path).path
+        def pred(e):
+            bp = urllib.parse.urlsplit(e.base_url).path.rstrip("/")
+            return bp == "" or dp == bp or dp.startswith(bp + "/")
+        return pred
+
+    def test_plan_request_never_reaches_coding_keys(self):
+        pool = self._pool()
+        elig = self._eligible_for("/api/plan/v3/chat/completions")
+        e1, n = pool.acquire(eligible=elig)
+        self.assertEqual(e1.key, "plan1")
+        self.assertEqual(n, 3)  # plan1, plan2, generic（coding 两把被排除）
+        # 同一请求内排除已试过的，继续切下一把，coding 依然不可达
+        e2, _ = pool.acquire(exclude={e1.key}, eligible=elig)
+        self.assertEqual(e2.key, "plan2")
+        e3, _ = pool.acquire(exclude={e1.key, e2.key}, eligible=elig)
+        self.assertEqual(e3.key, "generic")
+        e4, n = pool.acquire(exclude={e1.key, e2.key, e3.key}, eligible=elig)
+        self.assertIsNone(e4)
+        self.assertEqual(n, 0)
+
+    def test_coding_request_routes_to_coding_keys(self):
+        pool = self._pool()
+        elig = self._eligible_for("/api/coding/v3/chat/completions")
+        e1, n = pool.acquire(eligible=elig)
+        self.assertEqual(e1.key, "coding1")
+        self.assertEqual(n, 3)  # coding1, coding2, generic
+
+    def test_same_key_never_retried_within_request(self):
+        """网络失败不冷却，但同一请求内不能反复撞同一把 Key。"""
+        pool = self._pool()
+        seen = []
+        for _ in range(5):
+            e, n = pool.acquire(exclude=set(seen))
+            if e is None:
+                break
+            seen.append(e.key)
+        self.assertEqual(len(seen), len(set(seen)), "each key tried at most once per request")
+        self.assertEqual(sorted(seen), ["coding1", "coding2", "generic", "plan1", "plan2"])
 
 
 class TestQuotaNeverDisables(unittest.TestCase):
