@@ -93,7 +93,7 @@ python proxy_server.py
 nohup ./run-guarded.sh >/dev/null 2>&1 &       # 后台守护
 ```
 
-守护脚本下 Ctrl+C 即整体停止、不会误重启；代理被外部硬杀时，代理日志里 `proxy stopped` 缺失 + guard 日志里的 `exited with code N` 行就是死因证据。
+守护脚本直接**前台运行代理：控制台实时输出**，同时代理自身把日志按天落盘到 `logs/proxy-YYYYMMDD.log`（`LOG_FILE` 环境变量可改位置，按天轮转保留 14 天）。崩溃/被杀（非零退出码）3 秒后自动重启；Ctrl+C 即整体停止、不会误重启；代理被外部硬杀时，日志里 `proxy stopped` 缺失 + guard 的 `exited with code N` 行就是死因证据。
 
 重试换 Key 时会连同该 Key 绑定的地址一起切换（请求始终发往"当前 Key 自己的地址"）。
 

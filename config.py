@@ -34,3 +34,5 @@ UPSTREAM_TIMEOUT_SECONDS = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "600
 STREAM_READ_TIMEOUT_SECONDS = float(os.environ.get("STREAM_READ_TIMEOUT_SECONDS", "300"))
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+# 设置后日志同时写入该文件（按天轮转，保留 14 天）；控制台输出不受影响
+LOG_FILE = os.environ.get("LOG_FILE", "")

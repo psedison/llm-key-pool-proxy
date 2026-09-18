@@ -26,10 +26,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import config
 from key_pool import KeyEntry, KeyPool, mask_key
 
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format=LOG_FORMAT,
 )
+if config.LOG_FILE:
+    # 日志落盘（按天轮转）：控制台关闭/进程被杀后仍有完整现场，控制台输出不变
+    from logging.handlers import TimedRotatingFileHandler
+    _log_dir = os.path.dirname(config.LOG_FILE)
+    if _log_dir:
+        os.makedirs(_log_dir, exist_ok=True)
+    _fh = TimedRotatingFileHandler(config.LOG_FILE, when="midnight",
+                                   backupCount=14, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.getLogger().addHandler(_fh)
 log = logging.getLogger("proxy")
 
 # 上游响应里出现这些片段视为“配额/账号不可用”，与 403/429 同等对待
