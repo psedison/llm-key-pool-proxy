@@ -6,12 +6,16 @@
 
 仅用 Python 标准库（http.server + urllib），无第三方依赖。
 """
+import atexit
+import faulthandler
 import http.client
 import json
 import logging
 import os
 import re
+import signal
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -686,7 +690,20 @@ def run() -> None:
         log.info("  %s -> %s", mask_key(e.key), e.base_url)
 
     ProxyHandler.pool = pool
-    server = ThreadingHTTPServer((config.PROXY_HOST, config.PROXY_PORT), ProxyHandler)
+
+    class ProxyServer(ThreadingHTTPServer):
+        daemon_threads = True  # 退出时不等待挂起的流式连接（最长 600s 的读超时会卡住关机）
+
+        def handle_error(self, request, client_address):
+            # 请求线程的未捕获异常：打进结构化日志而不是裸 stderr，
+            # 避免日志断流时丢失现场
+            log.error("unhandled error in request thread from %s",
+                      client_address, exc_info=True)
+
+    server = ProxyServer((config.PROXY_HOST, config.PROXY_PORT), ProxyHandler)
+    faulthandler.enable()  # 段错误/abort 等致命崩溃时自动转储 Python 线程栈
+    atexit.register(lambda: log.info("proxy process exiting"))
+    log.info("process pid=%d", os.getpid())
     # 监听概要：0.0.0.0/:: 时额外提示本机访问地址，避免把监听接口误当访问地址
     if config.PROXY_HOST in ("0.0.0.0", "::"):
         access = f"http://127.0.0.1:{config.PROXY_PORT}"
@@ -695,14 +712,13 @@ def run() -> None:
     else:
         access = f"http://{config.PROXY_HOST}:{config.PROXY_PORT}"
         log.info("access URL (use this in downstream tools): %s", access)
-    # 下游 Base URL 推荐：代理是路径前缀转发器，前缀取决于各 Key 绑定地址的路径部分
-    base_paths = {urllib.parse.urlsplit(e.base_url).path.rstrip("/") for e in entries}
-    if len(base_paths) == 1:
-        only = next(iter(base_paths))
-        log.info("downstream Base URL: %s%s  (client appends /chat/completions)", access, only)
-    else:
-        log.info("downstream Base URL: %s<path-of-your-key's-base>  (multiple path prefixes in pool: %s)",
-                 access, ", ".join(sorted(base_paths)))
+    # 下游 Base URL 说明：对外前缀只是代理命名空间，任意已知前缀都可用，
+    # 上游地址完全由选中的 Key 决定（与对外前缀零耦合）
+    log.info(
+        "downstream Base URL: %s/<prefix>/chat/completions  (prefix is arbitrary; "
+        "exposed prefixes: %s; the selected key's own address decides the upstream)",
+        access, ", ".join(config.UPSTREAM_PATH_PREFIXES),
+    )
     log.info(
         "config: strategy=%s | cooldown base=%.0fs (quota=%.0fs, ratelimit=%.0fs, max=%.0fs)"
         " | disable threshold=%d auth fails | upstream timeout=%.0fs | keys=%d",
@@ -715,11 +731,25 @@ def run() -> None:
         config.UPSTREAM_TIMEOUT_SECONDS,
         len(entries),
     )
+
+    def _on_sigterm(signum, _frame):
+        # docker stop / 任务管理器结束进程等会发 SIGTERM；转到独立线程优雅停机
+        # （shutdown() 不允许在 serve_forever 所在线程调用，会死锁）
+        log.info("received signal %s, shutting down", signum)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
     try:
         server.serve_forever()
+        log.warning("server loop exited unexpectedly (no exception)")  # 正常情况不会走到
     except KeyboardInterrupt:
-        log.info("shutting down")
-        server.shutdown()
+        log.info("Ctrl+C received, shutting down")
+    except BaseException:
+        log.exception("server loop crashed with an unexpected exception!")  # 任何崩溃都留现场
+        raise
+    finally:
+        server.server_close()
+        log.info("proxy stopped, goodbye")
 
 
 if __name__ == "__main__":
