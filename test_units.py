@@ -1,7 +1,10 @@
 """key_pool 与代理纯逻辑的单元测试（无网络）。运行：python test_units.py"""
 import calendar
+import os
+import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.parse
 
 from key_pool import KeyEntry, KeyPool, mask_key
@@ -281,6 +284,45 @@ class TestModelMismatch(unittest.TestCase):
         self.assertEqual(e1.cooldown_until, 0.0, "mismatch must not cool the key down")
         self.assertEqual(e1.consecutive_fails, 0, "mismatch must not count toward disable")
         self.assertEqual(e1.total_fail, 10)  # 但记账保留，便于观察
+
+
+class TestDuplicateKeyDedup(unittest.TestCase):
+    def test_duplicate_key_dropped_with_first_wins(self):
+        """同 Key 重复行只保留首次出现；9 行含 1 重复 → 8 把（真实案例 2026-09-19）。"""
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("key-a|https://h1/api/plan/v3\n"
+                    "key-b|https://h1/api/plan/v3\n"
+                    "key-a|https://h1/api/plan/v3\n")  # 重复
+            path = f.name
+        try:
+            with unittest.mock.patch.dict(os.environ, {"KEYS_FILE": path}, clear=False):
+                import importlib
+                import config as config_mod
+                importlib.reload(config_mod)
+                import proxy_server
+                importlib.reload(proxy_server)
+                entries = proxy_server.load_entries()
+        finally:
+            os.unlink(path)
+        self.assertEqual([e.key for e in entries], ["key-a", "key-b"])
+
+    def test_same_key_different_url_also_deduped(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("key-a|https://h1/api/plan/v3\n"
+                    "key-a|https://h2/api/coding/v3\n")  # 同 Key 不同地址：也去重
+            path = f.name
+        try:
+            with unittest.mock.patch.dict(os.environ, {"KEYS_FILE": path}, clear=False):
+                import importlib
+                import config as config_mod
+                importlib.reload(config_mod)
+                import proxy_server
+                importlib.reload(proxy_server)
+                entries = proxy_server.load_entries()
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].base_url, "https://h1/api/plan/v3")  # 首次出现的地址生效
 
 
 class TestQuotaNeverDisables(unittest.TestCase):

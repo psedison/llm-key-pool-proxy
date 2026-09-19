@@ -112,27 +112,39 @@ def load_entries() -> list[KeyEntry]:
     """Key 池条目来源：KEYPOOL_KEYS 环境变量优先，其次 keys.txt。
 
     每项格式 "key|base_url"，base_url 必填（无默认上游假设）。
+    Key 字符串重复的行只保留第一次出现——重复几乎总是配置笔误，会打
+    WARNING 指明行号；同 Key 不同地址也会被去重并特别提示。
     """
     raw: list[str]
+    source: str
     env_keys = os.environ.get("KEYPOOL_KEYS", "")
     if env_keys.strip():
         raw = env_keys.split(",")
+        source = "KEYPOOL_KEYS env var"
     elif os.path.isfile(config.KEYS_FILE):
         with open(config.KEYS_FILE, "r", encoding="utf-8") as f:
             raw = f.readlines()
+        source = config.KEYS_FILE
     else:
         return []
-    seen: set[str] = set()
+    first_seen: dict[str, int] = {}
     entries: list[KeyEntry] = []
-    for item in raw:
+    for lineno, item in enumerate(raw, 1):
         parsed = parse_key_line(item)
         if not parsed:
             continue
         key, base_url = parsed
-        if key in seen:
+        if key in first_seen:
+            extra = " (注意：同 Key 但 base_url 不同)" if base_url != entries[
+                next(i for i, e in enumerate(entries) if e.key == key)].base_url else ""
+            log.warning(
+                "duplicate key %s at %s line %d ignored; first seen at line %d%s",
+                mask_key(key), source, lineno, first_seen[key], extra,
+            )
             continue
-        seen.add(key)
+        first_seen[key] = lineno
         entries.append(KeyEntry(key=key, base_url=base_url))
+    log.info("key source: %s | %d lines -> %d keys", source, len(raw), len(entries))
     return entries
 
 
