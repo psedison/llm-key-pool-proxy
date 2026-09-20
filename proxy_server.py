@@ -730,6 +730,14 @@ def run() -> None:
     for e in entries:
         log.info("  %s -> %s", mask_key(e.key), e.base_url)
 
+    _STRATEGY_DESC = {
+        "priority": "粘住第一把可用 Key（缓存最友好，适合独享池）",
+        "rotation": "窗口轮换，额度均摊（适合多人共用池）",
+        "round_robin": "逐请求轮换（每个请求换账号，缓存失效）",
+        "random": "随机选取",
+    }
+    log.info("key strategy: %s (%s)", pool.strategy, _STRATEGY_DESC.get(pool.strategy, "unknown"))
+
     ProxyHandler.pool = pool
 
     class ProxyServer(ThreadingHTTPServer):
@@ -779,6 +787,7 @@ def run() -> None:
             config.ROTATION_WINDOW_REQUESTS,
             config.ROTATION_WINDOW_SECONDS,
         )
+        log.info("current active key: %s", pool.rotation_status()["active_key"])
 
     def _on_sigterm(signum, _frame):
         # docker stop / 任务管理器结束进程等会发 SIGTERM；转到独立线程优雅停机
