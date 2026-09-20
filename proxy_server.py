@@ -433,7 +433,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     last_err_status, last_err_body = 403, rest
                     continue
                 self.pool.report_success(entry)
-                self._relay_response(resp, first_chunk, wants_stream)
+                self._relay_response(resp, first_chunk, wants_stream, entry)
                 return
 
             # 失败分支
@@ -520,7 +520,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             parts.append(f"reasoning={reasoning}")
         log.info("usage: %s", " ".join(parts))
 
-    def _relay_response(self, resp, first_chunk: bytes, wants_stream: bool) -> None:
+    def _record_usage(self, entry, usage: dict) -> None:
+        """输出 token 用量日志，并把消耗计入 rotation 窗口计数。"""
+        self._log_usage(usage)
+        tokens = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
+        if tokens > 0:
+            self.pool.report_usage(entry, tokens)
+
+    def _relay_response(self, resp, first_chunk: bytes, wants_stream: bool, entry) -> None:
         """把上游响应回传下游；流式逐块转发，非流式也按块回写（支持任意大小）。"""
         status = resp.status
         headers = resp.headers
@@ -622,7 +629,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if u:
                     usage_holder.append(u)
             if usage_holder:
-                self._log_usage(usage_holder[0])
+                self._record_usage(entry, usage_holder[0])
             return
 
         # 非流式：块式转发（65536B/块），总长度自动匹配，无 IncompleteRead 风险
@@ -636,7 +643,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             u = extract_json_usage(first_chunk) if first_chunk else None
         if u:
-            self._log_usage(u)
+            self._record_usage(entry, u)
         log.debug("relayed %d bytes non-stream", sent)
 
     # ----- HTTP 方法入口 -----
@@ -699,6 +706,14 @@ def run() -> None:
             ", ".join(unbound),
         )
         sys.exit(1)
+    if config.KEY_PICK_STRATEGY == "rotation" \
+            and max(config.ROTATION_WINDOW_TOKENS, config.ROTATION_WINDOW_REQUESTS) <= 0 \
+            and config.ROTATION_WINDOW_SECONDS <= 0:
+        log.error(
+            "strategy=rotation requires at least one window trigger > 0: "
+            "ROTATION_WINDOW_TOKENS / ROTATION_WINDOW_REQUESTS / ROTATION_WINDOW_SECONDS"
+        )
+        sys.exit(1)
     pool = KeyPool.from_entries(
         entries,
         strategy=config.KEY_PICK_STRATEGY,
@@ -707,6 +722,9 @@ def run() -> None:
         ratelimit_cooldown_seconds=config.KEY_RATELIMIT_COOLDOWN_SECONDS,
         cooldown_max_seconds=config.KEY_COOLDOWN_MAX_SECONDS,
         max_consecutive_fails=config.KEY_MAX_CONSECUTIVE_FAILS,
+        window_tokens=config.ROTATION_WINDOW_TOKENS,
+        window_requests=config.ROTATION_WINDOW_REQUESTS,
+        window_seconds=config.ROTATION_WINDOW_SECONDS,
     )
     log.info("loaded %d keys (strategy=%s):", len(entries), pool.strategy)
     for e in entries:
@@ -754,6 +772,13 @@ def run() -> None:
         config.UPSTREAM_TIMEOUT_SECONDS,
         len(entries),
     )
+    if pool.strategy == "rotation":
+        log.info(
+            "rotation windows: tokens>=%d or requests>=%d or seconds>=%s (first trigger switches)",
+            config.ROTATION_WINDOW_TOKENS,
+            config.ROTATION_WINDOW_REQUESTS,
+            config.ROTATION_WINDOW_SECONDS,
+        )
 
     def _on_sigterm(signum, _frame):
         # docker stop / 任务管理器结束进程等会发 SIGTERM；转到独立线程优雅停机

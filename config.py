@@ -1,5 +1,25 @@
-"""集中配置：环境变量优先，兜底默认值。"""
+"""集中配置：环境变量优先，其次项目目录下的 .env 文件，兜底内置默认值。"""
 import os
+
+
+def _load_dotenv() -> None:
+    """读取项目目录下的 .env 作为环境变量默认值；已存在的真实环境变量优先。"""
+    path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv()
 
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8787"))
@@ -21,7 +41,12 @@ KEYS_FILE = os.environ.get("KEYS_FILE", os.path.join(os.path.dirname(__file__), 
 
 # priority：按 keys.txt 顺序固定使用第一个可用 Key（缓存最友好，失败才顺延）
 # round_robin：轮询；random：随机
+# rotation：窗口轮换（共享池用）——所有流量打在活跃 Key 上，三触发器任一先到即切下一把
 KEY_PICK_STRATEGY = os.environ.get("KEY_PICK_STRATEGY", "priority")
+# rotation 窗口触发器：0=关闭；三个全 0 时 rotation 策略启动报错
+ROTATION_WINDOW_TOKENS = int(os.environ.get("ROTATION_WINDOW_TOKENS", "0"))
+ROTATION_WINDOW_REQUESTS = int(os.environ.get("ROTATION_WINDOW_REQUESTS", "0"))
+ROTATION_WINDOW_SECONDS = float(os.environ.get("ROTATION_WINDOW_SECONDS", "0"))
 KEY_COOLDOWN_SECONDS = float(os.environ.get("KEY_COOLDOWN_SECONDS", "60"))
 KEY_QUOTA_COOLDOWN_SECONDS = float(os.environ.get("KEY_QUOTA_COOLDOWN_SECONDS", "120"))
 KEY_RATELIMIT_COOLDOWN_SECONDS = float(os.environ.get("KEY_RATELIMIT_COOLDOWN_SECONDS", "5"))

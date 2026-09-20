@@ -325,6 +325,92 @@ class TestDuplicateKeyDedup(unittest.TestCase):
         self.assertEqual(entries[0].base_url, "https://h1/api/plan/v3")  # 首次出现的地址生效
 
 
+class TestRotationStrategy(unittest.TestCase):
+    """窗口轮换策略：活跃 Key + token/请求数/时间三触发器（共享池额度均摊）。"""
+
+    def _pool(self, **kw) -> KeyPool:
+        defaults = dict(
+            keys=[KeyEntry(key=k) for k in ("k1", "k2", "k3")],
+            strategy="rotation",
+            window_requests=3,
+            window_tokens=0,
+            window_seconds=0.0,
+        )
+        defaults.update(kw)
+        return KeyPool(**defaults)
+
+    def test_sticky_within_window(self):
+        """窗口内所有请求粘在同一把 Key 上（缓存友好）。"""
+        pool = self._pool()
+        picks = [pool.acquire()[0].key for _ in range(3)]
+        self.assertEqual(picks, ["k1", "k1", "k1"])
+
+    def test_request_window_triggers_rotation(self):
+        """第 4 个请求（窗口满 3）切换到下一把。"""
+        pool = self._pool()
+        picks = [pool.acquire()[0].key for _ in range(4)]
+        self.assertEqual(picks, ["k1", "k1", "k1", "k2"])
+
+    def test_token_window_triggers_rotation(self):
+        """token 累计达阈值触发切换：3 次 ×40 = 120 ≥ 100 → 第 4 次换 k2。"""
+        pool = self._pool(window_requests=0, window_tokens=100)
+        keys = []
+        for _ in range(4):
+            e, _ = pool.acquire()
+            keys.append(e.key)
+            pool.report_usage(e, 40)
+        self.assertEqual(keys, ["k1", "k1", "k1", "k2"])
+
+    def test_time_window_triggers_rotation(self):
+        pool = self._pool(window_requests=0, window_seconds=0.05)
+        self.assertEqual(pool.acquire()[0].key, "k1")
+        time.sleep(0.06)
+        self.assertEqual(pool.acquire()[0].key, "k2")
+
+    def test_unavailable_active_advances_and_resets_window(self):
+        """活跃 Key 进入冷却 → 立即切下一把，窗口重置（新 Key 拿完整窗口）。"""
+        pool = self._pool()
+        e1, _ = pool.acquire()
+        self.assertEqual(pool._window_requests, 1)
+        e1.cooldown_until = time.time() + 999
+        e2, _ = pool.acquire()
+        self.assertEqual(e2.key, "k2")
+        self.assertEqual(pool._window_requests, 1)  # 已重置，而非累加
+
+    def test_excluded_active_advances(self):
+        """tried 排除（同请求内已失败）等价于活跃 Key 不可用：换下一把并重置窗口。"""
+        pool = self._pool()
+        e1, _ = pool.acquire()
+        e2, _ = pool.acquire(exclude={e1.key})
+        self.assertEqual(e2.key, "k2")
+        self.assertEqual(pool._window_requests, 1)
+
+    def test_only_one_usable_stays_and_resets(self):
+        """只剩一把可用时退化为粘住它，窗口照常重置不刷屏。"""
+        pool = self._pool()
+        pool.keys[1].cooldown_until = time.time() + 999
+        pool.keys[2].cooldown_until = time.time() + 999
+        pool._window_started_at = time.time() - 999  # 强制窗口过期
+        picks = [pool.acquire()[0].key for _ in range(5)]
+        self.assertEqual(set(picks), {"k1"})
+
+    def test_rotation_requires_window_trigger(self):
+        with self.assertRaises(ValueError):
+            KeyPool(keys=[KeyEntry(key="k1")], strategy="rotation")
+
+    def test_status_reports_window(self):
+        pool = self._pool(window_tokens=100)
+        pool.acquire()
+        pool.report_usage(pool.keys[0], 40)
+        st = pool.rotation_status()
+        self.assertEqual(st["active_key"], mask_key("k1"))
+        self.assertEqual(st["window_requests"], 1)
+        self.assertEqual(st["window_tokens"], 40)
+        self.assertEqual(st["tokens_left"], 60)
+        # 其他策略无 rotation 状态
+        self.assertIsNone(self._pool(strategy="priority").rotation_status())
+
+
 class TestQuotaNeverDisables(unittest.TestCase):
     def _pool(self, keys=("k1", "k2")) -> KeyPool:
         return KeyPool(

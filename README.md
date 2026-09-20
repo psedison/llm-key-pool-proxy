@@ -8,9 +8,10 @@
 ## 特性
 
 - **Key 池管理**
-  - 三种选 Key 策略：
-    - `priority`（**默认**）：始终固定用排最前的可用 Key，失败才顺延到下一个——流量钉在单一账号上，**上游前缀缓存可以跨请求命中**，token 成本最低
-    - `round_robin`：轮询，负载最均匀，但跨账号会打散上游缓存
+  - 四种选 Key 策略：
+    - `priority`（**默认**）：始终固定用排最前的可用 Key，失败才顺延到下一个——流量钉在单一账号上，**上游前缀缓存可以跨请求命中**，token 成本最低。适合独享池
+    - `rotation`：**窗口轮换，多人共用池推荐**——所有流量打在"活跃 Key"上，token/请求数/时间三触发器任一先到即切下一把（沿 keys.txt 顺序，自动跳过冷却中的）。额度均摊，窗口内缓存仍保热；切换后第一发冷启动属预期代价
+    - `round_robin`：按请求逐个轮询，负载最均匀，但每个请求都换账号、上游缓存全失效（输入全价，共享池也不推荐）
     - `random`：随机
   - 可用时才参与选取；失败 Key 进入冷却并按**指数退避**（60s → 120s → 240s → … 封顶 1h；配额类从 120s 起步），冷却到点自动恢复参与选取，无需人工干预
   - 连续失败达到阈值（默认 3 次）自动禁用，可通过管理接口手动恢复
@@ -70,7 +71,10 @@ python proxy_server.py
 #   PROXY_PORT=8787          监听端口
 #   FALLBACK_BASE_URL=        可选兜底地址（不推荐；Key 应各自显式绑定地址）
 #   KEYPOOL_KEYS=key1|url1,key2,key3|url2   直接用环境变量注入 Key（优先于 keys.txt）
-#   KEY_PICK_STRATEGY=priority|round_robin|random  选 Key 策略，默认 priority（固定优先级，缓存友好）
+#   KEY_PICK_STRATEGY=priority|round_robin|random|rotation  选 Key 策略，默认 priority
+#   ROTATION_WINDOW_TOKENS=5000000   rotation：token 窗口（主触发，与配额计量同口径；0=关闭）
+#   ROTATION_WINDOW_REQUESTS=100     rotation：请求数窗口（0=关闭）
+#   ROTATION_WINDOW_SECONDS=1800     rotation：时间窗口（0=关闭）；三触发器先到先切
 #   KEY_COOLDOWN_SECONDS=60       失败冷却基数（指数退避：60→120→240→…）
 #   KEY_QUOTA_COOLDOWN_SECONDS=120 配额类失败的冷却基数
 #   KEY_RATELIMIT_COOLDOWN_SECONDS=5  频率限流冷却基数
@@ -94,6 +98,8 @@ nohup ./run-guarded.sh >/dev/null 2>&1 &       # 后台守护
 ```
 
 守护脚本直接**前台运行代理：控制台实时输出**，同时代理自身把日志按天落盘到 `logs/proxy-YYYYMMDD.log`（`LOG_FILE` 环境变量可改位置，按天轮转保留 14 天）。崩溃/被杀（非零退出码）3 秒后自动重启；Ctrl+C 即整体停止、不会误重启；代理被外部硬杀时，日志里 `proxy stopped` 缺失 + guard 的 `exited with code N` 行就是死因证据。
+
+**配置文件**：所有配置（端口/策略/轮换窗口/日志等）支持两种方式，优先级为 系统环境变量 > `.env` 文件 > 内置默认值。复制 `.env.example` 为 `.env` 即可修改；keys.txt 仍只放 Key。单文件偏好者也可不建 keys.txt，直接在 `.env` 的 `KEYPOOL_KEYS` 里写全部 Key。
 
 重试换 Key 时会连同该 Key 绑定的地址一起切换（请求始终发往"当前 Key 自己的地址"）。
 

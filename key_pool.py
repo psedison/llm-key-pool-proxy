@@ -38,8 +38,23 @@ class KeyPool:
     ratelimit_cooldown_seconds: float = 5.0  # 频率限流：几秒即可恢复
     cooldown_max_seconds: float = 3600.0  # 指数退避封顶（1 小时）
     max_consecutive_fails: int = 3
+    # rotation 策略窗口触发器（0=关闭该触发器；rotation 时至少一个 > 0）
+    window_tokens: int = 0       # 活跃 Key 窗口内累计输入+输出 token 阈值
+    window_requests: int = 0     # 活跃 Key 窗口内累计请求数阈值
+    window_seconds: float = 0.0  # 活跃 Key 窗口时长阈值
+    _active_index: int = 0       # rotation：当前活跃 Key 指针
+    _window_started_at: float = field(default_factory=time.time, repr=False)
+    _window_requests: int = 0    # 窗口内已服务请求数
+    _window_tokens: int = 0      # 窗口内已消耗 token 数
     _cursor: int = 0  # round_robin 游标
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def __post_init__(self):
+        if self.strategy == "rotation" and max(self.window_tokens, self.window_requests) <= 0 \
+                and self.window_seconds <= 0:
+            raise ValueError(
+                "rotation strategy requires at least one window trigger > 0 "
+                "(ROTATION_WINDOW_TOKENS / ROTATION_WINDOW_REQUESTS / ROTATION_WINDOW_SECONDS)")
 
     # ---------- 构造 ----------
 
@@ -53,10 +68,13 @@ class KeyPool:
         ratelimit_cooldown_seconds: float = 5.0,
         cooldown_max_seconds: float = 3600.0,
         max_consecutive_fails: int = 3,
+        window_tokens: int = 0,
+        window_requests: int = 0,
+        window_seconds: float = 0.0,
     ) -> "KeyPool":
         if not entries:
             raise ValueError("key pool is empty: no valid keys provided")
-        if strategy not in ("priority", "round_robin", "random"):
+        if strategy not in ("priority", "round_robin", "random", "rotation"):
             strategy = "priority"
         return cls(
             keys=entries,
@@ -66,6 +84,9 @@ class KeyPool:
             ratelimit_cooldown_seconds=ratelimit_cooldown_seconds,
             cooldown_max_seconds=cooldown_max_seconds,
             max_consecutive_fails=max(1, max_consecutive_fails),
+            window_tokens=window_tokens,
+            window_requests=window_requests,
+            window_seconds=window_seconds,
         )
 
     # ---------- 选取 ----------
@@ -89,7 +110,9 @@ class KeyPool:
                       if e.is_usable(now) and e.key not in exclude]
             if not usable:
                 return None, 0
-            if self.strategy == "random":
+            if self.strategy == "rotation":
+                chosen = self._acquire_rotation(usable, now)
+            elif self.strategy == "random":
                 chosen = random.choice(usable)
             elif self.strategy == "priority":
                 chosen = usable[0]
@@ -108,6 +131,47 @@ class KeyPool:
             chosen.last_used_at = now
             return chosen, len(usable)
 
+    def _acquire_rotation(self, usable: list[KeyEntry], now: float) -> KeyEntry:
+        """rotation 策略：流量集中在活跃 Key 上，窗口触发器先到先切。
+
+        - 活跃 Key 不可用（冷却/禁用/本请求已试过）→ 立即切下一把可用
+        - 时间/请求数/token 任一窗口到期 → 切下一把可用
+        - 切换（含"只有自己可用"的退化情形）都会重置窗口
+        """
+        usable_ids = {id(e) for e in usable}
+        n = len(self.keys)
+        active_idx = self._active_index % n
+        reason = None
+        if id(self.keys[active_idx]) not in usable_ids:
+            reason = "active key unavailable"
+        elif self.window_seconds > 0 and now - self._window_started_at >= self.window_seconds:
+            reason = "time window expired"
+        elif self.window_requests > 0 and self._window_requests >= self.window_requests:
+            reason = "request window exhausted"
+        elif self.window_tokens > 0 and self._window_tokens >= self.window_tokens:
+            reason = "token window exhausted"
+
+        if reason is not None:
+            chosen_idx = active_idx
+            for i in range(1, n + 1):
+                idx = (self._active_index + i) % n
+                if id(self.keys[idx]) in usable_ids:
+                    chosen_idx = idx
+                    break
+            if chosen_idx != active_idx:
+                log.info("rotation: %s -> switch to key %s",
+                         reason, mask_key(self.keys[chosen_idx].key))
+            else:
+                log.info("rotation: %s -> only this key usable, window reset",
+                         reason)
+            self._active_index = chosen_idx
+            self._window_started_at = now
+            self._window_requests = 0
+            self._window_tokens = 0
+        chosen = self.keys[self._active_index]
+        self._window_requests += 1
+        return chosen
+
     # ---------- 成功/失败记账 ----------
 
     def report_success(self, entry: KeyEntry) -> None:
@@ -116,6 +180,14 @@ class KeyPool:
             entry.total_success += 1
             entry.last_error = ""
             entry.cooldown_until = 0.0
+
+    def report_usage(self, entry: KeyEntry, tokens: int) -> None:
+        """rotation 窗口的 token 消耗计数（由响应 usage 解析回调触发）。"""
+        if tokens <= 0:
+            return
+        with self._lock:
+            if self.strategy == "rotation":
+                self._window_tokens += tokens
 
     def _cooldown_for(self, kind: str, fails_before: int) -> float:
         """冷却时长：按类别定基数，按连续失败指数退避并封顶。
@@ -204,6 +276,29 @@ class KeyPool:
 
     # ---------- 状态 ----------
 
+    def rotation_status(self) -> dict | None:
+        """rotation 策略的窗口状态；其他策略返回 None。"""
+        if self.strategy != "rotation":
+            return None
+        with self._lock:
+            now = time.time()
+            n = len(self.keys)
+            active = self.keys[self._active_index % n]
+            elapsed = max(0.0, now - self._window_started_at)
+            out = {
+                "active_key": mask_key(active.key),
+                "window_requests": self._window_requests,
+                "window_tokens": self._window_tokens,
+                "window_elapsed_s": round(elapsed, 1),
+            }
+            if self.window_seconds > 0:
+                out["time_left_s"] = max(0.0, round(self.window_seconds - elapsed, 1))
+            if self.window_requests > 0:
+                out["requests_left"] = max(0, self.window_requests - self._window_requests)
+            if self.window_tokens > 0:
+                out["tokens_left"] = max(0, self.window_tokens - self._window_tokens)
+            return out
+
     def status(self) -> dict:
         with self._lock:
             now = time.time()
@@ -229,5 +324,6 @@ class KeyPool:
                 "usable": usable,
                 "disabled": sum(1 for e in self.keys if not e.enabled),
                 "cooling": sum(1 for e in self.keys if e.enabled and e.cooldown_until > now),
+                "rotation": self.rotation_status(),
                 "keys": items,
             }
