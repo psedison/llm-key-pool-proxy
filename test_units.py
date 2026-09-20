@@ -408,7 +408,10 @@ class TestRotationStrategy(unittest.TestCase):
         self.assertEqual(st["window_tokens"], 40)
         self.assertEqual(st["tokens_left"], 60)
         # 其他策略无 rotation 状态
-        self.assertIsNone(self._pool(strategy="priority").rotation_status())
+        # 未启用 rotation 时：状态接口自带开启提示，不再返回 null
+        disabled = self._pool(strategy="priority").rotation_status()
+        self.assertFalse(disabled["enabled"])
+        self.assertIn("KEY_PICK_STRATEGY=rotation", disabled["hint"])
 
 
 class TestQuotaNeverDisables(unittest.TestCase):

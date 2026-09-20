@@ -276,16 +276,21 @@ class KeyPool:
 
     # ---------- 状态 ----------
 
-    def rotation_status(self) -> dict | None:
-        """rotation 策略的窗口状态；其他策略返回 None。"""
+    def rotation_status(self) -> dict:
+        """rotation 策略的窗口状态；未启用时返回带开启提示的说明。"""
         if self.strategy != "rotation":
-            return None
+            return {
+                "enabled": False,
+                "hint": "set KEY_PICK_STRATEGY=rotation (plus at least one "
+                        "ROTATION_WINDOW_* > 0) to enable windowed rotation",
+            }
         with self._lock:
             now = time.time()
             n = len(self.keys)
             active = self.keys[self._active_index % n]
             elapsed = max(0.0, now - self._window_started_at)
             out = {
+                "enabled": True,
                 "active_key": mask_key(active.key),
                 "window_requests": self._window_requests,
                 "window_tokens": self._window_tokens,
