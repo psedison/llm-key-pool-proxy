@@ -444,14 +444,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if fwd_path in ("", "/"):
             return self._send_group_info(group)
 
-        # 剩余路径必须命中已知暴露前缀（安全网：防止垃圾路径拼进上游 URL）
-        if not fwd_path.startswith(config.UPSTREAM_PATH_PREFIXES):
-            return self._send_json(404, {"error": {
-                "message": f"path not proxied: {fwd_path}",
-                "allowed_prefixes": list(config.UPSTREAM_PATH_PREFIXES),
-                "known_groups": sorted(self.pool.group_names()),
-            }})
-
+        # 组名之后的剩余路径 = 端点后缀，原样拼到"选中 Key 自己的地址"后面。
+        # 已知暴露前缀（UPSTREAM_PATH_PREFIXES）若出现会被剥离（兼容镜像式
+        # Base URL）；拼错路径由上游 404，无需代理白名单。
         max_attempts = max(1, len(self.pool.keys))
         last_err_status, last_err_body = 503, b'{"error":"no usable key"}'
         tried: set[str] = set()  # 同一请求内已尝试的 Key：网络失败不冷却，但不能反复撞同一把

@@ -72,14 +72,19 @@ volc-keypool-proxy/
    sk-xxx03|https://api.deepseek.com/v1|deepseek
    ```
 
-   下游用**路径首段**选择组（也可用查询参数 `?__pool=组名`）：
+   下游用**路径首段**选择组（也可用查询参数 `?__pool=组名`），端点后缀
+   （如 `/chat/completions`）原样拼到"选中 Key 自己的地址"后面：
 
    | Base URL | 使用的 Key 组 |
    | --- | --- |
-   | `http://127.0.0.1:8787/ark-plan/api/plan/v3` | ark-plan 组 |
-   | `http://127.0.0.1:8787/ark-coding/api/coding/v3` | ark-coding 组 |
-   | `http://127.0.0.1:8787/deepseek/v1` | deepseek 组 |
-   | `http://127.0.0.1:8787/api/v3`（不带组名） | default 组（未打标的 Key） |
+   | `http://127.0.0.1:8787/ark-plan` | ark-plan 组 |
+   | `http://127.0.0.1:8787/ark-coding` | ark-coding 组 |
+   | `http://127.0.0.1:8787/deepseek` | deepseek 组 |
+   | `http://127.0.0.1:8787/api/v3`（不带组名，镜像式） | default 组（未打标的 Key） |
+
+   两种写法都有效：`/<组名>/chat/completions`（干净式，推荐）与
+   `/<组名>/<上游路径>/chat/completions`（镜像式，兼容已有配置）——
+   已知暴露前缀（UPSTREAM_PATH_PREFIXES）会被剥离。
 
    组内策略（priority/rotation 等）照常生效，rotation 窗口**按组独立记账**；
    裸组路径 `GET /<组名>` 返回该组概要；组名不要与暴露前缀重名，`/pool/*` 为保留字。

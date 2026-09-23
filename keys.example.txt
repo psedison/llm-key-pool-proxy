@@ -17,8 +17,8 @@
 # sk-xxx04|https://api.deepseek.com/v1|deepseek
 # sk-xxx05|https://api.openai.com/v1
 #
-# 下游接入示例：
-#   用火山 plan 组：  Base URL = http://127.0.0.1:8787/ark-plan/api/plan/v3
-#   用火山 coding 组：Base URL = http://127.0.0.1:8787/ark-coding/api/coding/v3
-#   用 DeepSeek 组：  Base URL = http://127.0.0.1:8787/deepseek/v1
-#   不指定组（default）：Base URL = http://127.0.0.1:8787/api/v3
+# 下游接入示例（Base URL = 代理地址 + /组名，端点路径由 SDK 自动追加）：
+#   用火山 plan 组：  Base URL = http://127.0.0.1:8787/ark-plan
+#   用火山 coding 组：Base URL = http://127.0.0.1:8787/ark-coding
+#   用 DeepSeek 组：  Base URL = http://127.0.0.1:8787/deepseek
+#   不指定组（default）：Base URL = http://127.0.0.1:8787/api/v3（镜像式，兼容旧配置）
