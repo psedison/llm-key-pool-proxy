@@ -568,7 +568,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"in={usage.get('prompt_tokens', '?')}",
             f"out={usage.get('completion_tokens', '?')}",
         ]
-        if cached is not None:
+        if cached is None:
+            # 上游未报缓存字段（第三方网关常见）：显式 n/a，与"报了但为 0"区分开
+            parts.append("cached=n/a")
+        else:
             prompt = usage.get("prompt_tokens") or 0
             hit_pct = f" ({cached * 100 // prompt}%)" if prompt else ""
             parts.append(f"cached={cached}{hit_pct}")

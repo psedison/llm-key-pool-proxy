@@ -8,6 +8,7 @@ import unittest.mock
 import urllib.parse
 
 from key_pool import KeyEntry, KeyPool, mask_key
+import proxy_server
 from proxy_server import (
     build_upstream_url,
     resolve_group_and_path,
@@ -481,6 +482,30 @@ class TestRotationStrategy(unittest.TestCase):
         disabled = self._pool(strategy="priority").rotation_status()
         self.assertFalse(disabled["enabled"])
         self.assertIn("KEY_PICK_STRATEGY=rotation", disabled["hint"])
+
+
+class TestUsageLogging(unittest.TestCase):
+    def test_missing_cache_field_logs_na(self):
+        """上游未报缓存字段 → cached=n/a（与报了 0 区分）。"""
+        import logging
+        with self.assertLogs("proxy", level="INFO") as cap:
+            proxy_server.ProxyHandler._log_usage({"prompt_tokens": 15, "completion_tokens": 421})
+        self.assertTrue(any("cached=n/a" in m for m in cap.output), cap.output)
+
+    def test_zero_cache_logs_zero(self):
+        import logging
+        with self.assertLogs("proxy", level="INFO") as cap:
+            proxy_server.ProxyHandler._log_usage({
+                "prompt_tokens": 49, "completion_tokens": 105,
+                "prompt_tokens_details": {"cached_tokens": 0}})
+        self.assertTrue(any("cached=0 (0%)" in m for m in cap.output), cap.output)
+
+    def test_cache_hit_logs_percentage(self):
+        with self.assertLogs("proxy", level="INFO") as cap:
+            proxy_server.ProxyHandler._log_usage({
+                "prompt_tokens": 1000, "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 990}})
+        self.assertTrue(any("cached=990 (99%)" in m for m in cap.output), cap.output)
 
 
 class TestQuotaNeverDisables(unittest.TestCase):
