@@ -83,9 +83,8 @@ def main():
                KEYPOOL_KEYS=(f"ag-1aaaa|{UP_BASE}/api/plan/v3|ark-plan,"
                              f"ag-2bbbb|{UP_BASE}/api/v3|gB,"
                              f"ag-3cccc|{UP_BASE}/api/v3|gB,"
-                             f"ag-4dddd|{UP_BASE}/api/v3,"
-                             f"sk-5eeee|{UP_BASE}/v1|docode_cc,"
-                             f"sk-6ffff|{UP_BASE}/v1|docode_deepseek"),
+                             f"ag-4dddd|{UP_BASE}/api/v3,sk-5eeee|{UP_BASE}/v1|docode_cc,sk-6ffff|{UP_BASE}/v1|docode_gc,sk-7gggg|{UP_BASE}/v1|docode_gpt,"
+),
                PROXY_PORT=str(PROXY_PORT), PROXY_HOST="127.0.0.1",
                KEY_PICK_STRATEGY="rotation", ROTATION_WINDOW_REQUESTS="2",
                LOG_LEVEL="WARNING")
@@ -141,7 +140,7 @@ def main():
         r = post("/docode_cc/chat/completions")
         check("Docode Claude 组干净路由",
               r["served"] == "eeee" and r["upstream_path"] == "/v1/chat/completions")
-        r = post("/docode_deepseek/chat/completions")
+        r = post("/docode_gc/chat/completions")
         check("Docode DeepSeek 组干净路由",
               r["served"] == "ffff" and r["upstream_path"] == "/v1/chat/completions")
         # 组之间隔离：不带组名仍只走 default 的 dddd，不会误选两个 Docode key
@@ -153,10 +152,18 @@ def main():
         check("Docode 裸组路径 → 组概要",
               info["group"] == "docode_cc" and info["total"] == 1 and info["usable"] == 1)
 
-        # 8) 管理接口
+        # 8) 真实新增分组的 API 约定：三个服务组都用 /v1 端点（上游 /models 是 HTML 控制台，
+        # OpenAI 兼容模型列表应使用 /v1/models）。本地 echo 验证路径拼接。
+        for group in ("docode_cc", "docode_gc", "docode_gpt"):
+            r = post(f"/{group}/v1/models")
+            expected_tail = {"docode_cc": "eeee", "docode_gc": "ffff", "docode_gpt": "gggg"}[group]
+            check(f"{group} clean /v1 route", r["served"] == expected_tail,
+                  f"served={r['served']} expected={expected_tail}")
+
+        # 9) 管理接口
         st = json.loads(urllib.request.urlopen(PROXY_BASE + "/pool/status", timeout=10).read())
         check("/pool/status 含全部分组视图与 rotation 窗口",
-              set(st["groups"]) == {"ark-plan", "gB", "default", "docode_cc", "docode_deepseek"}
+              set(st["groups"]) == {"ark-plan", "gB", "default", "docode_cc", "docode_gc", "docode_gpt"}
               and "active_key" in st["groups"]["gB"])
         rec_req = urllib.request.Request(PROXY_BASE + "/pool/recover", data=b"{}", method="POST")
         rec = json.loads(urllib.request.urlopen(rec_req, timeout=10).read())
