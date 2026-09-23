@@ -173,6 +173,12 @@ def load_entries() -> list[KeyEntry]:
             )
             continue
         first_seen[key] = lineno
+        if base_url and not urllib.parse.urlsplit(base_url).path.rstrip("/"):
+            log.warning(
+                "key %s binds a pathless base_url (%s): the downstream path will be "
+                "mirrored onto it verbatim. If the upstream serves its API under a "
+                "path (e.g. /v1), include it: %s/<path>",
+                mask_key(key), base_url, base_url)
         entries.append(KeyEntry(key=key, base_url=base_url, groups=set(groups)))
     log.info("key source: %s | %d lines -> %d keys", source, len(raw), len(entries))
     return entries
