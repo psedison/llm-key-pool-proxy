@@ -24,7 +24,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
-from key_pool import KeyEntry, KeyPool, mask_key
+from key_pool import DEFAULT_GROUP, KeyEntry, KeyPool, mask_key
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 logging.basicConfig(
@@ -97,21 +97,51 @@ MANAGEMENT_PATHS = ("/pool/status", "/pool/recover")
 
 # ---------- Key 池装载 ----------
 
-def parse_key_line(line: str) -> tuple[str, str] | None:
-    """解析一行 Key 配置："key" 或 "key|base_url"。返回 (key, base_url)，base_url 可为空串。"""
+def resolve_group_and_path(group_names: set, path: str,
+                           query_group: str | None = None) -> tuple[str, str]:
+    """解析请求归属的 Key 分组与转发路径。
+
+    规则：
+    - 查询参数 __pool=<组名>（query_group 或路径自带）显式指定组，转发路径原样保留
+    - 路径首段命中已注册组名 → 该组；剥离 "/组名" 段，剩余为转发路径
+    - 其余情况（含根路径 / 与未知首段）→ default 组，路径原样
+    """
+    raw = urllib.parse.urlsplit(path)
+    if not query_group:
+        query_group = urllib.parse.parse_qs(raw.query).get("__pool", [None])[0]
+    if query_group:
+        return query_group.strip() or DEFAULT_GROUP, raw.path or "/"
+    seg0 = raw.path.lstrip("/").split("/", 1)[0]
+    if seg0 and seg0 in group_names:
+        # 路径形如 "/<组名>/..."：组名前有一个 '/'，剥离时要把两个字符都算上
+        rest = raw.path[1 + len(seg0):]
+        return seg0, "/" + rest.lstrip("/")
+    return DEFAULT_GROUP, raw.path or "/"
+
+
+def parse_key_line(line: str) -> tuple[str, str, frozenset] | None:
+    """解析一行 Key 配置："key|base_url" 或 "key|base_url|分组1,分组2"。
+
+    返回 (key, base_url, groups)；未写分组时归入 default 组。
+    """
     line = line.strip()
     if not line or line.startswith("#"):
         return None
-    if "|" in line:
-        key, _, base_url = line.partition("|")
-        return key.strip(), base_url.strip().rstrip("/")
-    return line, ""
+    parts = line.split("|")
+    key = parts[0].strip()
+    base_url = parts[1].strip().rstrip("/") if len(parts) > 1 else ""
+    groups_raw = "|".join(parts[2:]) if len(parts) > 2 else ""  # 分组段内的竖线原样保留
+    groups = {g.strip() for g in groups_raw.split(",") if g.strip()} if groups_raw else set()
+    if not groups:
+        groups = {DEFAULT_GROUP}
+    return key, base_url, frozenset(groups)
 
 
 def load_entries() -> list[KeyEntry]:
     """Key 池条目来源：KEYPOOL_KEYS 环境变量优先，其次 keys.txt。
 
-    每项格式 "key|base_url"，base_url 必填（无默认上游假设）。
+    每项格式 "key|base_url" 或 "key|base_url|分组1,分组2"，base_url 必填
+    （无默认上游假设）。分组未写时归 default 组。
     Key 字符串重复的行只保留第一次出现——重复几乎总是配置笔误，会打
     WARNING 指明行号；同 Key 不同地址也会被去重并特别提示。
     """
@@ -133,7 +163,7 @@ def load_entries() -> list[KeyEntry]:
         parsed = parse_key_line(item)
         if not parsed:
             continue
-        key, base_url = parsed
+        key, base_url, groups = parsed
         if key in first_seen:
             extra = " (注意：同 Key 但 base_url 不同)" if base_url != entries[
                 next(i for i, e in enumerate(entries) if e.key == key)].base_url else ""
@@ -143,7 +173,7 @@ def load_entries() -> list[KeyEntry]:
             )
             continue
         first_seen[key] = lineno
-        entries.append(KeyEntry(key=key, base_url=base_url))
+        entries.append(KeyEntry(key=key, base_url=base_url, groups=set(groups)))
     log.info("key source: %s | %d lines -> %d keys", source, len(raw), len(entries))
     return entries
 
@@ -338,10 +368,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ----- 上游转发 -----
 
-    def _build_upstream_request(self, body: bytes, entry) -> urllib.request.Request:
-        # 上游 URL 完全由 Key 自己的地址决定：剥离对外前缀（代理的命名空间），
-        # 端点后缀拼到 Key 地址后面——对外前缀与后端地址零耦合
-        upstream_url = build_upstream_url(entry.base_url, self.path)
+    def _build_upstream_request(self, body: bytes, entry, fwd_path: str) -> urllib.request.Request:
+        # 上游 URL 完全由 Key 自己的地址决定：剥离对外前缀与组名段（代理的命名空间），
+        # 端点后缀拼到 Key 地址后面——对外路径与后端地址零耦合
+        upstream_url = build_upstream_url(entry.base_url, fwd_path)
         headers = {
             "Content-Type": self.headers.get("Content-Type", "application/json"),
             "Accept": self.headers.get("Accept", "application/json"),
@@ -356,7 +386,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             headers=headers, method=self.command,
         )
 
-    def _forward_once(self, body: bytes, entry):
+    def _forward_once(self, body: bytes, entry, fwd_path: str):
         """用 entry.key 请求上游一次。
 
         返回 (kind, resp_or_error)：
@@ -365,7 +395,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         - ("fatal", (status, body_bytes))：不可重试失败（其他 4xx）
         - ("network", (status, message))：连不上上游（status 502/504 语义）
         """
-        req = self._build_upstream_request(body, entry)
+        req = self._build_upstream_request(body, entry, fwd_path)
         # urllib 的 timeout 是 socket 级单值（作用于连接与每次读），不支持元组
         timeout = (
             config.STREAM_READ_TIMEOUT_SECONDS
@@ -399,27 +429,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ----- 主转发循环（含换 Key 重试） -----
 
+    def _resolve_group_and_path(self) -> tuple[str, str]:
+        return resolve_group_and_path(self.pool.group_names(), self.path)
+
+    def _send_group_info(self, group: str) -> None:
+        self._send_json(200, self.pool.group_info(group))
+
     def _relay(self) -> None:
         body = self._read_request_body()
         wants_stream = self._client_wants_stream(body)
+        group, fwd_path = self._resolve_group_and_path()
+
+        # 裸组路径或根路径：返回组概要（核对分组配置用），不打上游
+        if fwd_path in ("", "/"):
+            return self._send_group_info(group)
+
+        # 剩余路径必须命中已知暴露前缀（安全网：防止垃圾路径拼进上游 URL）
+        if not fwd_path.startswith(config.UPSTREAM_PATH_PREFIXES):
+            return self._send_json(404, {"error": {
+                "message": f"path not proxied: {fwd_path}",
+                "allowed_prefixes": list(config.UPSTREAM_PATH_PREFIXES),
+                "known_groups": sorted(self.pool.group_names()),
+            }})
+
         max_attempts = max(1, len(self.pool.keys))
         last_err_status, last_err_body = 503, b'{"error":"no usable key"}'
         tried: set[str] = set()  # 同一请求内已尝试的 Key：网络失败不冷却，但不能反复撞同一把
 
         for attempt in range(1, max_attempts + 1):
-            entry, usable = self.pool.acquire(exclude=tried)
+            entry, usable = self.pool.acquire(exclude=tried, group=group)
             if entry is None:
-                log.warning("no usable key at attempt %d (%d already tried)",
-                            attempt, len(tried))
+                log.warning("no usable key in group '%s' at attempt %d (%d already tried)",
+                            group, attempt, len(tried))
                 break
             tried.add(entry.key)
             log.info(
-                "try %d of %d using key %s (usable=%d in pool) %s -> %s%s [upstream=%s]",
-                attempt, max_attempts, mask_key(entry.key), usable, self.command,
-                self.path, " [stream]" if wants_stream else "",
+                "try %d of %d using key %s (group=%s, usable=%d) %s -> %s%s [upstream=%s]",
+                attempt, max_attempts, mask_key(entry.key), group, usable, self.command,
+                fwd_path, " [stream]" if wants_stream else "",
                 entry.base_url,
             )
-            kind, result = self._forward_once(body, entry)
+            kind, result = self._forward_once(body, entry, fwd_path)
 
             if kind == "ok":
                 resp = result
@@ -433,7 +483,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     last_err_status, last_err_body = 403, rest
                     continue
                 self.pool.report_success(entry)
-                self._relay_response(resp, first_chunk, wants_stream, entry)
+                self._relay_response(resp, first_chunk, wants_stream, group)
                 return
 
             # 失败分支
@@ -471,16 +521,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             last_err_status, last_err_body = status, err_body
 
         # 所有尝试用尽 / 无可用 Key
-        self._relay_pool_exhausted(last_err_status, last_err_body)
+        self._relay_pool_exhausted(last_err_status, last_err_body, group)
 
-    def _relay_pool_exhausted(self, status: int, err_body: bytes) -> None:
+    def _relay_pool_exhausted(self, status: int, err_body: bytes, group: str = DEFAULT_GROUP) -> None:
         st = self.pool.status()
         log.error("all attempts exhausted (last upstream status=%d, usable=%d/%d)",
                   status, st["usable"], st["total"])
         payload = {
             "error": {
-                "message": "All upstream keys failed or pool exhausted (last upstream error attached)",
+                "message": f"All keys in group '{group}' failed or pool exhausted (last upstream error attached)",
                 "type": "key_pool_exhausted",
+                "group": group,
                 "last_upstream_status": status,
                 "pool": st,
             }
@@ -520,14 +571,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             parts.append(f"reasoning={reasoning}")
         log.info("usage: %s", " ".join(parts))
 
-    def _record_usage(self, entry, usage: dict) -> None:
-        """输出 token 用量日志，并把消耗计入 rotation 窗口计数。"""
+    def _record_usage(self, group: str, usage: dict) -> None:
+        """输出 token 用量日志，并把消耗计入所属分组的 rotation 窗口计数。"""
         self._log_usage(usage)
         tokens = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
         if tokens > 0:
-            self.pool.report_usage(entry, tokens)
+            self.pool.report_usage(group, tokens)
 
-    def _relay_response(self, resp, first_chunk: bytes, wants_stream: bool, entry) -> None:
+    def _relay_response(self, resp, first_chunk: bytes, wants_stream: bool, group: str) -> None:
         """把上游响应回传下游；流式逐块转发，非流式也按块回写（支持任意大小）。"""
         status = resp.status
         headers = resp.headers
@@ -629,7 +680,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if u:
                     usage_holder.append(u)
             if usage_holder:
-                self._record_usage(entry, usage_holder[0])
+                self._record_usage(group, usage_holder[0])
             return
 
         # 非流式：块式转发（65536B/块），总长度自动匹配，无 IncompleteRead 风险
@@ -643,7 +694,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             u = extract_json_usage(first_chunk) if first_chunk else None
         if u:
-            self._record_usage(entry, u)
+            self._record_usage(group, u)
         log.debug("relayed %d bytes non-stream", sent)
 
     # ----- HTTP 方法入口 -----
@@ -652,9 +703,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             if self._is_management():
                 self._handle_management(self.command)
-                return
-            if not self.path.startswith(config.UPSTREAM_PATH_PREFIXES):
-                self._send_json(404, {"error": f"path not proxied; allowed prefixes: {config.UPSTREAM_PATH_PREFIXES}"})
                 return
             self._relay()
         except (BrokenPipeError, ConnectionResetError):
@@ -787,7 +835,8 @@ def run() -> None:
             config.ROTATION_WINDOW_REQUESTS,
             config.ROTATION_WINDOW_SECONDS,
         )
-        log.info("current active key: %s", pool.rotation_status()["active_key"])
+        for gname in sorted(pool.group_names()):
+            log.info("group '%s' active key: %s", gname, pool.rotation_status(gname)["active_key"])
 
     def _on_sigterm(signum, _frame):
         # docker stop / 任务管理器结束进程等会发 SIGTERM；转到独立线程优雅停机

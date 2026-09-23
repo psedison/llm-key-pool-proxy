@@ -1,12 +1,24 @@
 # Key 池配置模板
 # 复制本文件为 keys.txt（keys.txt 已被 .gitignore 排除，不会上传），填入真实 Key。
 #
-# 每行一个，# 开头为注释。格式：key|base_url（地址必填，代理无默认上游假设）
+# 每行一个，# 开头为注释。格式（前两列必填，第三列可选）：
+#   key|base_url                    —— 未打分组标签，归 default 组
+#   key|base_url|分组1,分组2        —— 打分组标签（可多组）；同名 Key 去重按整行 Key
 #
-# 行序 = priority 策略的优先级（第一行是主力账号，流量固定在它上面，上游前缀缓存最友好）
+# 组名用于 URL 路由：下游 Base URL 写 http://代理地址/<组名>/... 即固定使用该组的 Key；
+# 不带组名（或 /）的请求走 default 组。组内策略（priority/rotation 等）照常生效，
+# rotation 的窗口状态按组独立记账。
+# 注意：组名不要与暴露前缀（/api/v3、/v1 等）重名，管理路径 /pool/* 为保留字。
 #
-# 示例：A 地址挂 2 个 key，B 地址挂 1 个 key（任何 OpenAI 兼容上游均可）
-# ag-xxxxxxxxaaaaaaaa|https://ark.cn-beijing.volces.com/api/plan/v3
-# ag-xxxxxxxxbbbbbbbb|https://ark.cn-beijing.volces.com/api/plan/v3
-# sk-xxxxxxxxcccccccc|https://api.deepseek.com/v1
-# sk-proj-xxxxxxxxdddd|https://api.openai.com/v1
+# 示例：火山 plan 组 2 把、coding 组 1 把、DeepSeek 组 1 把、未分组 1 把
+# ark-xxx01|https://ark.cn-beijing.volces.com/api/plan/v3|ark-plan
+# ark-xxx02|https://ark.cn-beijing.volces.com/api/plan/v3|ark-plan
+# ark-xxx03|https://ark.cn-beijing.volces.com/api/coding/v3|ark-coding
+# sk-xxx04|https://api.deepseek.com/v1|deepseek
+# sk-xxx05|https://api.openai.com/v1
+#
+# 下游接入示例：
+#   用火山 plan 组：  Base URL = http://127.0.0.1:8787/ark-plan/api/plan/v3
+#   用火山 coding 组：Base URL = http://127.0.0.1:8787/ark-coding/api/coding/v3
+#   用 DeepSeek 组：  Base URL = http://127.0.0.1:8787/deepseek/v1
+#   不指定组（default）：Base URL = http://127.0.0.1:8787/api/v3

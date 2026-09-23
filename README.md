@@ -62,7 +62,29 @@ volc-keypool-proxy/
 
    行序即 priority 策略的优先级（第一行是主力账号，缓存钉在它上面）。
 
-2. 启动代理：
+2. （可选）给 Key 打分组标签，实现"一个代理同时服务多个平台"：
+
+   keys.txt 第三列写组名（逗号分隔可多组；不写归 default 组）：
+
+   ```
+   ark-xxx01|https://ark.cn-beijing.volces.com/api/plan/v3|ark-plan
+   ark-xxx02|https://ark.cn-beijing.volces.com/api/coding/v3|ark-coding
+   sk-xxx03|https://api.deepseek.com/v1|deepseek
+   ```
+
+   下游用**路径首段**选择组（也可用查询参数 `?__pool=组名`）：
+
+   | Base URL | 使用的 Key 组 |
+   | --- | --- |
+   | `http://127.0.0.1:8787/ark-plan/api/plan/v3` | ark-plan 组 |
+   | `http://127.0.0.1:8787/ark-coding/api/coding/v3` | ark-coding 组 |
+   | `http://127.0.0.1:8787/deepseek/v1` | deepseek 组 |
+   | `http://127.0.0.1:8787/api/v3`（不带组名） | default 组（未打标的 Key） |
+
+   组内策略（priority/rotation 等）照常生效，rotation 窗口**按组独立记账**；
+   裸组路径 `GET /<组名>` 返回该组概要；组名不要与暴露前缀重名，`/pool/*` 为保留字。
+
+3. 启动代理：
 
 ```bash
 python proxy_server.py

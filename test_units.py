@@ -10,6 +10,7 @@ import urllib.parse
 from key_pool import KeyEntry, KeyPool, mask_key
 from proxy_server import (
     build_upstream_url,
+    resolve_group_and_path,
     classify_failure,
     looks_like_quota_error,
     looks_like_rate_limit_error,
@@ -21,21 +22,29 @@ from proxy_server import (
 
 class TestParseKeyLine(unittest.TestCase):
     def test_plain_key(self):
-        self.assertEqual(parse_key_line("ark-abc"), ("ark-abc", ""))
+        key, url, groups = parse_key_line("ark-abc")
+        self.assertEqual((key, url, groups), ("ark-abc", "", frozenset({"default"})))
 
     def test_key_with_base_url(self):
-        key, url = parse_key_line("ark-abc | https://host/api/plan/v3/")
-        self.assertEqual((key, url), ("ark-abc", "https://host/api/plan/v3"))
+        key, url, groups = parse_key_line("ark-abc | https://host/api/plan/v3/")
+        self.assertEqual((key, url, groups), ("ark-abc", "https://host/api/plan/v3", frozenset({"default"})))
+
+    def test_key_with_groups(self):
+        key, url, groups = parse_key_line("ark-abc|https://host/api/plan/v3|ark-plan, ark-coding")
+        self.assertEqual(key, "ark-abc")
+        self.assertEqual(url, "https://host/api/plan/v3")
+        self.assertEqual(groups, frozenset({"ark-plan", "ark-coding"}))
 
     def test_comment_and_empty(self):
         self.assertIsNone(parse_key_line("# comment"))
         self.assertIsNone(parse_key_line("   "))
 
     def test_pipe_inside_url_kept(self):
-        # 分隔符只取第一个竖线
-        key, url = parse_key_line("k|http://a|x")
+        # 第三个字段（分组）内的竖线原样保留（无损）
+        key, url, groups = parse_key_line("k|http://a|x|g1")
         self.assertEqual(key, "k")
-        self.assertEqual(url, "http://a|x")
+        self.assertEqual(url, "http://a")
+        self.assertEqual(groups, frozenset({"x|g1"}))
 
 
 class TestKeyPoolPriority(unittest.TestCase):
@@ -261,6 +270,37 @@ class TestUpstreamUrlBuilding(unittest.TestCase):
             "https://api.deepseek.com/api/plan/v3/chat/completions")
 
 
+
+class TestGroupPathResolution(unittest.TestCase):
+    GN = {"gA", "gB", "default"}
+
+    def test_group_path_stripped(self):
+        self.assertEqual(
+            resolve_group_and_path(self.GN, "/gA/api/v3/chat/completions"),
+            ("gA", "/api/v3/chat/completions"))
+
+    def test_bare_group_path(self):
+        self.assertEqual(resolve_group_and_path(self.GN, "/gA"), ("gA", "/"))
+        self.assertEqual(resolve_group_and_path(self.GN, "/gA/"), ("gA", "/"))
+
+    def test_unknown_first_segment_goes_default_with_path(self):
+        self.assertEqual(
+            resolve_group_and_path(self.GN, "/api/v3/chat/completions"),
+            ("default", "/api/v3/chat/completions"))
+
+    def test_root_goes_default(self):
+        self.assertEqual(resolve_group_and_path(self.GN, "/"), ("default", "/"))
+
+    def test_query_param_selects_group(self):
+        self.assertEqual(
+            resolve_group_and_path(self.GN, "/api/v3/chat/completions?__pool=gB"),
+            ("gB", "/api/v3/chat/completions"))
+
+    def test_multi_char_group_name(self):
+        self.assertEqual(
+            resolve_group_and_path({"ark-plan"}, "/ark-plan/api/v3/chat/completions"),
+            ("ark-plan", "/api/v3/chat/completions"))
+
 class TestModelMismatch(unittest.TestCase):
     REAL_BODY = (
         b'{"error":{"code":"UnsupportedModel","message":"The requested model does not '
@@ -358,7 +398,7 @@ class TestRotationStrategy(unittest.TestCase):
         for _ in range(4):
             e, _ = pool.acquire()
             keys.append(e.key)
-            pool.report_usage(e, 40)
+            pool.report_usage("default", 40)
         self.assertEqual(keys, ["k1", "k1", "k1", "k2"])
 
     def test_time_window_triggers_rotation(self):
@@ -371,11 +411,11 @@ class TestRotationStrategy(unittest.TestCase):
         """活跃 Key 进入冷却 → 立即切下一把，窗口重置（新 Key 拿完整窗口）。"""
         pool = self._pool()
         e1, _ = pool.acquire()
-        self.assertEqual(pool._window_requests, 1)
+        self.assertEqual(pool._rot["default"]["requests"], 1)
         e1.cooldown_until = time.time() + 999
         e2, _ = pool.acquire()
         self.assertEqual(e2.key, "k2")
-        self.assertEqual(pool._window_requests, 1)  # 已重置，而非累加
+        self.assertEqual(pool._rot["default"]["requests"], 1)  # 已重置，而非累加
 
     def test_excluded_active_advances(self):
         """tried 排除（同请求内已失败）等价于活跃 Key 不可用：换下一把并重置窗口。"""
@@ -383,14 +423,15 @@ class TestRotationStrategy(unittest.TestCase):
         e1, _ = pool.acquire()
         e2, _ = pool.acquire(exclude={e1.key})
         self.assertEqual(e2.key, "k2")
-        self.assertEqual(pool._window_requests, 1)
+        self.assertEqual(pool._rot["default"]["requests"], 1)
 
     def test_only_one_usable_stays_and_resets(self):
         """只剩一把可用时退化为粘住它，窗口照常重置不刷屏。"""
         pool = self._pool()
         pool.keys[1].cooldown_until = time.time() + 999
         pool.keys[2].cooldown_until = time.time() + 999
-        pool._window_started_at = time.time() - 999  # 强制窗口过期
+        pool.acquire()  # 先建立 default 组的窗口状态
+        pool._rot["default"]["started_at"] = time.time() - 999  # 强制窗口过期
         picks = [pool.acquire()[0].key for _ in range(5)]
         self.assertEqual(set(picks), {"k1"})
 
@@ -401,11 +442,11 @@ class TestRotationStrategy(unittest.TestCase):
     def test_status_reports_window(self):
         pool = self._pool(window_tokens=100)
         pool.acquire()
-        pool.report_usage(pool.keys[0], 40)
+        pool.report_usage("default", 40)
         st = pool.rotation_status()
         self.assertEqual(st["active_key"], mask_key("k1"))
-        self.assertEqual(st["window_requests"], 1)
-        self.assertEqual(st["window_tokens"], 40)
+        self.assertEqual(st["requests"], 1)
+        self.assertEqual(st["tokens"], 40)
         self.assertEqual(st["tokens_left"], 60)
         # 其他策略无 rotation 状态
         # 未启用 rotation 时：状态接口自带开启提示，不再返回 null
