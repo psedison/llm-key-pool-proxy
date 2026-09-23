@@ -511,7 +511,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 entry, f"HTTP {status}: {err_body[:200]!r}", fail_kind,
                 cooldown_until=reset_at,
             )
-            if fail_kind == "quota" and reset_at:
+            if fail_kind == "mismatch":
+                detail = "rotate (no cooldown: key or its upstream cannot serve this request)"
+            elif fail_kind == "quota" and reset_at:
                 until = datetime.fromtimestamp(reset_at).strftime("%Y-%m-%d %H:%M:%S")
                 detail = f"cooldown until quota reset {until}"
             else:
@@ -598,8 +600,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         def pump(reader) -> int:
             sent = 0
+            # 首块写入同样要防下游断连（12:16 的真实 traceback 就出在这里：
+            # 客户端在首块到达前断开，异常穿透到 _dispatch 打出整页堆栈）
             if first_chunk:
-                self.wfile.write(first_chunk)
+                try:
+                    self.wfile.write(first_chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+                    log.info("client disconnected before first byte: %s", e)
+                    self.close_connection = True
+                    try:
+                        resp.close()
+                    except OSError:
+                        pass
+                    return 0
                 sent += len(first_chunk)
             while True:
                 try:

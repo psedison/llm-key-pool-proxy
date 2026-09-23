@@ -199,6 +199,17 @@ def main() -> None:
     st, d, _ = post("/api/plan/v3/chat/completions", b'{"model":"m","messages":[]}')
     print(f"[T8] client abort mid-stream: proxy still alive, follow-up request {st}")
 
+    # T9 客户端在首块到达前即断开：代理必须优雅收尾（历史 bug：异常穿透打出 traceback）
+    s = socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=30)
+    s.sendall(b"POST /api/plan/v3/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+              b'Content-Length: 52\r\n\r\n{"model":"m","messages":[],"stream":true,"pad":"xx"}')
+    s.close()  # 立即断开，不给代理写首块的机会
+    time.sleep(0.5)
+    st, d, _ = post("/api/plan/v3/chat/completions", b'{"model":"m","messages":[]}')
+    log = open("proxy_large.log", encoding="utf-8", errors="replace").read()
+    tb = log.count("Traceback")
+    print(f"[T9] client abort before first byte: proxy alive ({st}), traceback count in log = {tb}")
+
     proxy.terminate()
     upstream.shutdown()
     print("done")
