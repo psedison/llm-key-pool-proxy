@@ -85,7 +85,9 @@ RATE_LIMIT_MARKERS = (
 # support the agent plan feature. ..."}
 MODEL_MISMATCH_MARKERS = (
     "unsupportedmodel",
+    "model_not_found",       # 火山/new_api 系下划线格式（真实报文 2026-09-23）
     "model not found",
+    "no available channel",  # new_api 分发器：该分组下无此模型渠道
     "does not support",
     "not support the",
     "不支持",

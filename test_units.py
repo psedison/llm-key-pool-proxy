@@ -311,6 +311,13 @@ class TestModelMismatch(unittest.TestCase):
         self.assertEqual(classify_failure(404, self.REAL_BODY), "mismatch")
         self.assertTrue(looks_like_model_mismatch(self.REAL_BODY))
 
+    def test_real_new_api_model_not_found_body(self):
+        """真实报文（2026-09-23）：new_api 系 model_not_found（下划线）+ 无可用渠道。"""
+        body = (b'{"error":{"code":"model_not_found","message":"No available channel for '
+                b'model deepseek-v4-flash-vision-exp under group gpt pro (distributor) '
+                b'(request id: ...)","type":"new_api_error"}}')
+        self.assertEqual(classify_failure(503, body), "mismatch")
+
     def test_unknown_404_is_mismatch(self):
         self.assertEqual(classify_failure(404, b""), "mismatch")
         self.assertEqual(classify_failure(404, b'{"error":"no page"}'), "mismatch")
