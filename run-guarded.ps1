@@ -4,6 +4,8 @@
 $ErrorActionPreference = "Continue"
 $python = if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { "python" }
 
+$env:PYTHONNOUSERSITE = "1"  # 代理仅用标准库；跳过用户站点目录，免疫残留 .pth 导致的启动崩溃
+
 $logDir = Join-Path $PSScriptRoot "logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
 $env:LOG_FILE = Join-Path $logDir ("proxy-{0:yyyyMMdd}.log" -f (Get-Date))

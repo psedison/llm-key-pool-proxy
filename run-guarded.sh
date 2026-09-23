@@ -7,6 +7,7 @@ set -u
 cd "$(dirname "$0")"
 
 PYTHON="${PYTHON_BIN:-python3}"
+export PYTHONNOUSERSITE=1  # 代理仅用标准库；跳过用户站点目录，免疫残留 .pth 导致的启动崩溃
 mkdir -p logs
 export LOG_FILE="logs/proxy-$(date +%Y%m%d).log"
 
