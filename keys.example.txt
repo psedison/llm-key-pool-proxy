@@ -8,6 +8,9 @@
 # 组名用于 URL 路由：下游 Base URL 写 http://代理地址/<组名>/... 即固定使用该组的 Key；
 # 不带组名（或 /）的请求走 default 组。组内策略（priority/rotation 等）照常生效，
 # rotation 的窗口状态按组独立记账。
+# 地址必须写到服务完整前缀（含 /api/plan/v3、/v1 这类路径），转发以它为准。
+# ⚠ 只写域名（如 https://docode.cc）不行：端点会原样拼到域名根上，打到网站
+#   前端而非 API（nginx 405）。启动日志对这类配置会打 WARNING。
 # 注意：组名不要与暴露前缀（/api/v3、/v1 等）重名，管理路径 /pool/* 为保留字。
 #
 # 示例：火山 plan 组 2 把、coding 组 1 把、DeepSeek 组 1 把、未分组 1 把

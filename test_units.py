@@ -346,6 +346,27 @@ class TestDuplicateKeyDedup(unittest.TestCase):
             os.unlink(path)
         self.assertEqual([e.key for e in entries], ["key-a", "key-b"])
 
+    def test_pathless_base_url_logs_warning(self):
+        """纯域名地址易错（端点拼到根上）：load_entries 必须打 WARNING 提示补路径。"""
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write("key-a|https://docode.cc|docode_cc\n")
+            path = f.name
+        try:
+            import logging
+            with self.assertLogs("proxy", level="WARNING") as captured:
+                with unittest.mock.patch.dict(os.environ, {"KEYS_FILE": path}, clear=False):
+                    import importlib
+                    import config as config_mod
+                    importlib.reload(config_mod)
+                    import proxy_server
+                    importlib.reload(proxy_server)
+                    entries = proxy_server.load_entries()
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(any("pathless base_url" in m for m in captured.output),
+                        f"warning not found in: {captured.output}")
+
     def test_same_key_different_url_also_deduped(self):
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
             f.write("key-a|https://h1/api/plan/v3\n"
