@@ -773,6 +773,17 @@ def run() -> None:
     for e in entries:
         log.info("  %s -> %s", mask_key(e.key), e.base_url)
 
+    # 分组名冲突预警：组名通过 URL 路径首段选择，与保留字/暴露前缀重名会被遮蔽
+    prefix_first_segs = {p.strip("/").split("/")[0] for p in config.UPSTREAM_PATH_PREFIXES}
+    for g in sorted(pool.group_names()):
+        if g in ("pool",):
+            log.warning("group '%s' is reserved (/pool/* = management paths); "
+                        "URL requests cannot reach it - rename the group", g)
+        elif g.split("/", 1)[0] in prefix_first_segs:
+            log.warning("group '%s' shares its first segment with an exposed path "
+                        "prefix - group selection takes precedence, mirror-form "
+                        "default routing for that segment is shadowed", g)
+
     _STRATEGY_DESC = {
         "priority": "粘住第一把可用 Key（缓存最友好，适合独享池）",
         "rotation": "窗口轮换，额度均摊（适合多人共用池）",
