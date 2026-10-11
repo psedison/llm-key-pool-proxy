@@ -325,13 +325,17 @@ class TestModelMismatch(unittest.TestCase):
                 b'does not have a valid CodingPlan subscription, or your subscription has expired."}}')
         self.assertEqual(classify_failure(400, body), "auth")
 
-    def test_plain_400_is_client_error(self):
-        """普通 400 参数错误 → client（透传，不换 Key、不冷却）。"""
-        self.assertEqual(classify_failure(400, b'{"error":"invalid params"}'), "client")
+    def test_plain_400_rotates(self):
+        """未知 400 → mismatch（轮换不冷却）：多平台池下其他 Key 可能能服务。"""
+        self.assertEqual(classify_failure(400, b'{"error":"invalid params"}'), "mismatch")
 
-    def test_405_nginx_html_is_client_error(self):
-        """nginx 405 HTML → client（路径/方法错误透传）。"""
-        self.assertEqual(classify_failure(405, b"<html>405 Not Allowed</html>"), "client")
+    def test_405_nginx_html_rotates(self):
+        """nginx 405 HTML → mismatch：换 Key 重试而不是直接失败。"""
+        self.assertEqual(classify_failure(405, b"<html>405 Not Allowed</html>"), "mismatch")
+
+    def test_409_422_also_rotate(self):
+        self.assertEqual(classify_failure(409, b"conflict"), "mismatch")
+        self.assertEqual(classify_failure(422, b"unprocessable"), "mismatch")
 
     def test_unknown_404_is_mismatch(self):
         self.assertEqual(classify_failure(404, b""), "mismatch")

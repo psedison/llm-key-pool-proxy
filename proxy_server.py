@@ -263,7 +263,8 @@ def build_upstream_url(base_url: str, downstream_path: str) -> str:
 def classify_failure(status: int, body: bytes) -> str:
     """返回失败类别：quota | ratelimit | mismatch | auth | server。决定冷却时长。
 
-    顺序：先按报文精确归类（ratelimit → 订阅失效 → quota → 模型不匹配），再按状态码兜底。
+    顺序：先按报文精确归类（ratelimit → 订阅失效 → quota → 模型不匹配），再按状态码兜底；
+    未知 4xx 一律按 mismatch 轮换——多平台池下其他 Key 可能能服务，绝不提前放弃。
     429/408/425 的语义就是"限流/重试"，无论报文文案是什么，都不得落为
     server——server 类会计入禁用阈值且冷却更长，历史上曾因火山未知的
     429 文案把整个 Key 池打瘫（真实事故 2026-09-15）。
@@ -287,7 +288,9 @@ def classify_failure(status: int, body: bytes) -> str:
     if status == 404:
         return "mismatch"  # 未知 404：大概率该 Key 的服务不提供此端点/模型
     if 400 <= status < 500:
-        return "client"  # 客户端参数/方法错误：不是 Key 的问题，原样透传
+        # 未知 4xx：报文无法识别，但多平台池下其他 Key 可能能服务——
+        # 轮换（不冷却，Key 可能只是不支持这个模型/路径），全池失败才返回
+        return "mismatch"
     return "server"
 
 
@@ -431,14 +434,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             err_body = e.read() or b""
             kind = classify_failure(e.code, err_body)
-            if kind == "client":
-                return "fatal", (e.code, err_body)  # 客户端错误：透传，不换 Key
             reset_at = parse_reset_time(err_body) if kind == "quota" else None
             return "retryable", (e.code, err_body, kind, reset_at)
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             # 网络故障（DNS/连接/超时）不是任何 Key 的错：不记账、不冷却、不禁用。
             # 换 Key 重试仍有意义——多个上游地址时可能恰好某个可达。
             return "network", (502, str(e).encode("utf-8"))
+        except Exception as e:
+            # 未识别异常（畸形响应/上游实现怪异等）：同样轮换而不是让整个请求失败。
+            # 类型与摘要进日志保留现场；全池失败时最后一条会附带给下游。
+            log.warning("unrecognized upstream error (%s: %s); trying next key",
+                        type(e).__name__, str(e)[:120])
+            return "network", (502, f"{type(e).__name__}: {e}".encode("utf-8"))
         # 2xx 但响应体带配额错误标记的兜底（个别网关 200 包错误 JSON 的情况少见，仅提示）
         return "ok", resp
 
@@ -518,12 +525,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 last_err_status, last_err_body = result[0], result[1]
                 continue
-            else:  # client：客户端参数/方法/路径错误，不是 Key 的问题，原样透传
-                status, err_body = result
-                log.info("passing through upstream client error (HTTP %d): %r",
-                         status, err_body[:150].decode("utf-8", "replace"))
-                self._relay_error(status, err_body)
-                return
+            else:  # 防御：未知返回形态按网络故障轮换，不放弃请求
+                log.warning("unexpected forward result kind=%r; trying next key", kind)
+                last_err_status, last_err_body = 502, repr(result)[:200].encode("utf-8")
+                continue
 
             disabled = self.pool.report_failure(
                 entry, f"HTTP {status}: {err_body[:200]!r}", fail_kind,
@@ -565,15 +570,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except ValueError:
                 payload["error"]["last_upstream_error"] = err_body.decode("utf-8", "replace")[:1000]
         self._send_json(503, payload)
-
-    def _relay_error(self, status: int, body: bytes) -> None:
-        """非 Key 原因的 4xx：原样透传上游错误。"""
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
 
     @staticmethod
     def _log_usage(usage: dict) -> None:

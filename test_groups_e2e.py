@@ -75,8 +75,25 @@ def post(path, body=None):
 
 
 def main():
+    class BrokenUpstream(BaseHTTPRequestHandler):
+        """坏上游：回垃圾状态行后立即断开（模拟畸形响应，触发未识别异常路径）。"""
+
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(n)
+            self.wfile.write(b"NOT-HTTP/1.1 garbage-status-line\r\n\r\n")
+            self.wfile.flush()
+            self.close_connection = True
+
+        def log_message(self, *a):
+            pass
+
     srv = ThreadingHTTPServer(("127.0.0.1", UP_PORT), Echo)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    broken_srv = ThreadingHTTPServer(("127.0.0.1", UP_PORT + 2), BrokenUpstream)
+    threading.Thread(target=broken_srv.serve_forever, daemon=True).start()
 
     logf = open("proxy_groups_e2e.log", "w")
     env = dict(os.environ,
@@ -84,7 +101,8 @@ def main():
                              f"ag-2bbbb|{UP_BASE}/api/v3|gB,"
                              f"ag-3cccc|{UP_BASE}/api/v3|gB,"
                              f"ag-4dddd|{UP_BASE}/api/v3,sk-5eeee|{UP_BASE}/v1|docode_cc,sk-6ffff|{UP_BASE}/v1|docode_gc,sk-7gggg|{UP_BASE}/v1|docode_gpt,"
-),
+                             f"ag-8bad0|http://127.0.0.1:{UP_PORT + 2}/api/v3|gBad,"
+                             f"ag-9good|{UP_BASE}/api/v3|gBad"),
                PROXY_PORT=str(PROXY_PORT), PROXY_HOST="127.0.0.1",
                KEY_PICK_STRATEGY="rotation", ROTATION_WINDOW_REQUESTS="2",
                LOG_LEVEL="WARNING")
@@ -152,6 +170,10 @@ def main():
         check("Docode 裸组路径 → 组概要",
               info["group"] == "docode_cc" and info["total"] == 1 and info["usable"] == 1)
 
+        # 7.5) 坏上游（未识别异常）所在组的请求自动轮换到组内好 Key
+        seq = [post("/gBad/api/v3/chat/completions")["served"] for _ in range(3)]
+        check("坏上游自动轮换到组内好 Key", all(t == "good" for t in seq), str(seq))
+
         # 8) 真实新增分组的 API 约定：三个服务组都用 /v1 端点（上游 /models 是 HTML 控制台，
         # OpenAI 兼容模型列表应使用 /v1/models）。本地 echo 验证路径拼接。
         for group in ("docode_cc", "docode_gc", "docode_gpt"):
@@ -163,7 +185,7 @@ def main():
         # 9) 管理接口
         st = json.loads(urllib.request.urlopen(PROXY_BASE + "/pool/status", timeout=10).read())
         check("/pool/status 含全部分组视图与 rotation 窗口",
-              set(st["groups"]) == {"ark-plan", "gB", "default", "docode_cc", "docode_gc", "docode_gpt"}
+              set(st["groups"]) == {"ark-plan", "gB", "default", "docode_cc", "docode_gc", "docode_gpt", "gBad"}
               and "active_key" in st["groups"]["gB"])
         rec_req = urllib.request.Request(PROXY_BASE + "/pool/recover", data=b"{}", method="POST")
         rec = json.loads(urllib.request.urlopen(rec_req, timeout=10).read())
@@ -171,6 +193,7 @@ def main():
     finally:
         p.terminate()
         srv.shutdown()
+        broken_srv.shutdown()
 
     print("=" * 40)
     print("ALL PASS" if not FAILURES else f"FAILED: {FAILURES}")
