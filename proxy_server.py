@@ -80,6 +80,15 @@ RATE_LIMIT_MARKERS = (
     "频率",
 )
 
+# 订阅失效/未订阅（账号级，续费前该 Key 持续不可用）：按 auth 语义冷却+禁用
+# 真实报文样例（2026-10-11）：{"code":"InvalidSubscription","message":"Your account (2101273760)
+# does not have a valid CodingPlan subscription, or your subscription has expired. ..."}
+SUBSCRIPTION_ERROR_MARKERS = (
+    "invalidsubscription",
+    "subscription expired",
+    "does not have a valid",
+)
+
 # 模型/服务不匹配（该 Key 的上游不提供此请求所需的能力）：换 Key 重试，不冷却
 # 真实报文样例：{"code":"UnsupportedModel","message":"The requested model does not
 # support the agent plan feature. ..."}
@@ -188,12 +197,6 @@ def load_entries() -> list[KeyEntry]:
 
 # ---------- 上游错误判定 ----------
 
-def is_retryable_status(status: int) -> bool:
-    # 401/403 鉴权失败；404 服务/模型不匹配（换 Key 换地址重试）；
-    # 408/425/429 限流；5xx 上游故障 → 换 Key
-    return status in (401, 403, 404, 408, 425, 429) or status >= 500
-
-
 def looks_like_quota_error(body: bytes) -> bool:
     if not body:
         return False
@@ -260,7 +263,7 @@ def build_upstream_url(base_url: str, downstream_path: str) -> str:
 def classify_failure(status: int, body: bytes) -> str:
     """返回失败类别：quota | ratelimit | mismatch | auth | server。决定冷却时长。
 
-    顺序：先按报文精确归类（ratelimit → quota → 模型不匹配），再按状态码兜底。
+    顺序：先按报文精确归类（ratelimit → 订阅失效 → quota → 模型不匹配），再按状态码兜底。
     429/408/425 的语义就是"限流/重试"，无论报文文案是什么，都不得落为
     server——server 类会计入禁用阈值且冷却更长，历史上曾因火山未知的
     429 文案把整个 Key 池打瘫（真实事故 2026-09-15）。
@@ -269,6 +272,10 @@ def classify_failure(status: int, body: bytes) -> str:
     """
     if looks_like_rate_limit_error(body):
         return "ratelimit"
+    if looks_like_subscription_error(body):
+        # 订阅失效：短语比 quota 的通用标记（如 "expired"）更具体，必须先判，
+        # 否则 "subscription has expired" 会撞上 quota 的 "expired" 被误归为配额
+        return "auth"  # 续费前该 Key 不可用，按无效凭证语义冷却+禁用
     if looks_like_quota_error(body):
         return "quota"
     if looks_like_model_mismatch(body):
@@ -279,7 +286,16 @@ def classify_failure(status: int, body: bytes) -> str:
         return "ratelimit"  # 报文未识别的限流类状态码：按频率限流兜底（短冷却、不禁用）
     if status == 404:
         return "mismatch"  # 未知 404：大概率该 Key 的服务不提供此端点/模型
+    if 400 <= status < 500:
+        return "client"  # 客户端参数/方法错误：不是 Key 的问题，原样透传
     return "server"
+
+
+def looks_like_subscription_error(body: bytes) -> bool:
+    if not body:
+        return False
+    text = body[:4096].decode("utf-8", errors="replace").lower()
+    return any(m in text for m in SUBSCRIPTION_ERROR_MARKERS)
 
 
 def looks_like_model_mismatch(body: bytes) -> bool:
@@ -414,11 +430,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
             err_body = e.read() or b""
-            if is_retryable_status(e.code):
-                kind = classify_failure(e.code, err_body)
-                reset_at = parse_reset_time(err_body) if kind == "quota" else None
-                return "retryable", (e.code, err_body, kind, reset_at)
-            return "fatal", (e.code, err_body)
+            kind = classify_failure(e.code, err_body)
+            if kind == "client":
+                return "fatal", (e.code, err_body)  # 客户端错误：透传，不换 Key
+            reset_at = parse_reset_time(err_body) if kind == "quota" else None
+            return "retryable", (e.code, err_body, kind, reset_at)
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             # 网络故障（DNS/连接/超时）不是任何 Key 的错：不记账、不冷却、不禁用。
             # 换 Key 重试仍有意义——多个上游地址时可能恰好某个可达。
@@ -502,8 +518,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 last_err_status, last_err_body = result[0], result[1]
                 continue
-            else:  # fatal：其他 4xx 不是 Key 的问题，直接回传
+            else:  # client：客户端参数/方法/路径错误，不是 Key 的问题，原样透传
                 status, err_body = result
+                log.info("passing through upstream client error (HTTP %d): %r",
+                         status, err_body[:150].decode("utf-8", "replace"))
                 self._relay_error(status, err_body)
                 return
 

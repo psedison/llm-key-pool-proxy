@@ -319,6 +319,20 @@ class TestModelMismatch(unittest.TestCase):
                 b'(request id: ...)","type":"new_api_error"}}')
         self.assertEqual(classify_failure(503, body), "mismatch")
 
+    def test_real_invalid_subscription_body(self):
+        """真实报文（2026-10-11）：CodingPlan 订阅失效（400）→ auth（冷却+禁用语义）。"""
+        body = (b'{"error":{"code":"InvalidSubscription","message":"Your account (2101273760) '
+                b'does not have a valid CodingPlan subscription, or your subscription has expired."}}')
+        self.assertEqual(classify_failure(400, body), "auth")
+
+    def test_plain_400_is_client_error(self):
+        """普通 400 参数错误 → client（透传，不换 Key、不冷却）。"""
+        self.assertEqual(classify_failure(400, b'{"error":"invalid params"}'), "client")
+
+    def test_405_nginx_html_is_client_error(self):
+        """nginx 405 HTML → client（路径/方法错误透传）。"""
+        self.assertEqual(classify_failure(405, b"<html>405 Not Allowed</html>"), "client")
+
     def test_unknown_404_is_mismatch(self):
         self.assertEqual(classify_failure(404, b""), "mismatch")
         self.assertEqual(classify_failure(404, b'{"error":"no page"}'), "mismatch")
